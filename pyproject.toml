@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stiflyt-db"
+version = "1.0.0"
+description = "Database manager for Kartverket/Geonorge PostGIS datasets"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Stiflyt"}
+]
+keywords = ["postgis", "kartverket", "geonorge", "gis", "database"]
+
+dependencies = [
+    "psycopg2-binary>=2.9.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=23.0",
+    "flake8>=6.0",
+]
+
+[project.scripts]
+download-kartverket = "scripts.download_kartverket:main"
+load-dataset = "scripts.load_dataset:main"
+update-datasets = "scripts.update_datasets:main"
+db-status = "scripts.db_status:main"
+inspect-db = "scripts.inspect_db:main"
+
+[tool.setuptools]
+packages = ["scripts"]
+
+[tool.setuptools.package-data]
+scripts = ["*.py"]
+

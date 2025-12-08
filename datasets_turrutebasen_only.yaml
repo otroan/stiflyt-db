@@ -1,0 +1,10 @@
+# Configuration file for downloading only turrutebasen
+# Test configuration
+
+- name: turrutebasen
+  dataset: "Turrutebasen PostGIS-format"
+  format: PostGIS
+  utm_zone: 25833  # Available: 25833
+  area_filter: Norge  # Nationwide data only
+  output_dir: ./data/turrutebasen
+

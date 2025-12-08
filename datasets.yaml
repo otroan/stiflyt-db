@@ -1,0 +1,24 @@
+# Configuration file for downloading Kartverket/Geonorge datasets
+# Generated for: turrutebasen (PostGIS), teig (PostGIS), stedsnavn (GML)
+
+- name: turrutebasen
+  dataset: "Turrutebasen PostGIS-format"
+  format: PostGIS
+  utm_zone: 25833  # Available: 25833
+  area_filter: Norge  # Nationwide data only
+  output_dir: ./data/turrutebasen
+
+- name: teig
+  dataset: "Matrikkelen - Eiendomskart Teig PostGIS-format"
+  format: PostGIS
+  utm_zone: 25833  # Available: 25833
+  area_filter: Norge  # Nationwide data only
+  output_dir: ./data/matrikkel
+
+- name: stedsnavn
+  dataset: "Stedsnavn (komplett SSR) GML-format"
+  format: GML
+  utm_zone: 4258  # EPSG:4258 (WGS84) - GML uses geographic coordinates
+  area_filter: Norge  # Nationwide data only
+  output_dir: ./data/stedsnavn
+
