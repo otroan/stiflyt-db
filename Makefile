@@ -11,7 +11,7 @@ VENV := venv
 PYTHON := $(VENV)/bin/python3
 PIP := $(VENV)/bin/pip
 
-.PHONY: dependencies download-matrikkel create-db ensure-db drop-db load-matrikkel setup-matrikkel reload-matrikkel inspect-matrikkel inspect-wsdl run-api test update-datasets db-status inspect-db
+.PHONY: dependencies download-matrikkel create-db ensure-db drop-db load-matrikkel setup-matrikkel reload-matrikkel inspect-matrikkel inspect-wsdl run-api test update-datasets db-status inspect-db run-migrations verify-migration build-links
 
 # Install all required system dependencies (Ubuntu/Debian)
 dependencies:
@@ -145,6 +145,20 @@ db-status: $(VENV)
 # Inspect database schema (tables, columns, indexes, SRIDs)
 inspect-db: $(VENV)
 	@$(PYTHON) scripts/inspect_db.py $(PGDATABASE) --tables
+
+# Run database migrations (creates indexes, updates statistics, etc.)
+# Migrations run automatically after update-datasets, but can be run manually
+run-migrations: $(VENV)
+	@$(PYTHON) scripts/run_migrations.py $(PGDATABASE)
+
+# Verify that migration indexes were created successfully
+verify-migration: $(VENV)
+	@$(PYTHON) scripts/verify_migration.py $(PGDATABASE)
+
+# Build links from segments and anchor nodes
+# Creates links and link_segments tables with topology
+build-links: $(VENV)
+	@$(PYTHON) scripts/build_links.py
 
 # Ensure virtual environment exists
 $(VENV):

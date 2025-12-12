@@ -142,12 +142,51 @@ def ensure_postgis_extension(db_params: dict) -> bool:
         return False
 
 
-def extract_table_names_from_sql(sql_file: Path) -> List[str]:
-    """Extract table names from SQL file by looking for CREATE TABLE statements."""
+def extract_schema_prefix_from_sql(content: str) -> Optional[str]:
+    """Extract schema prefix from SQL content.
+
+    Kartverket SQL files use schemas like: turogfriluftsruter_b9b25c7668da494b9894d492fc35290d
+    This function extracts the prefix part (before the hash): turogfriluftsruter
+
+    The hash is typically 32 hexadecimal characters after an underscore.
+
+    Returns:
+        Schema prefix (e.g., 'turogfriluftsruter') or None if not found
+    """
+    # Match CREATE TABLE schema.table or CREATE SCHEMA schema
+    # Schema names follow pattern: prefix_32hexchars
+    # Examples: turogfriluftsruter_b9b25c7668da494b9894d492fc35290d
+    #           matrikkeleneiendomskartteig_d56c3a44c39b43ae8081f08a97a28c7d
+    pattern = r'(?:CREATE\s+(?:TABLE|SCHEMA)\s+(?:IF\s+NOT\s+EXISTS\s+)?|SET\s+search_path\s+TO\s+)(\w+)_[a-f0-9]{32}'
+    matches = re.findall(pattern, content, re.IGNORECASE)
+    if matches:
+        # Return the first matching prefix
+        return matches[0]
+
+    # Alternative: try to find schema names in CREATE TABLE statements
+    pattern2 = r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)_[a-f0-9]{32}\.'
+    matches2 = re.findall(pattern2, content, re.IGNORECASE)
+    if matches2:
+        return matches2[0]
+
+    return None
+
+
+def extract_table_names_from_sql(sql_file: Path) -> tuple[List[str], Optional[str]]:
+    """Extract table names and schema prefix from SQL file by looking for CREATE TABLE statements.
+
+    Returns:
+        Tuple of (table_names, schema_prefix)
+    """
     table_names = []
+    schema_prefix = None
     try:
         with open(sql_file, 'r', encoding='utf-8') as f:
             content = f.read()
+
+            # Extract schema prefix
+            schema_prefix = extract_schema_prefix_from_sql(content)
+
             # Match CREATE TABLE schema.table_name or CREATE TABLE table_name
             pattern = r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:(\w+)\.)?(\w+)'
             matches = re.findall(pattern, content, re.IGNORECASE)
@@ -158,7 +197,83 @@ def extract_table_names_from_sql(sql_file: Path) -> List[str]:
                     table_names.append(table)
     except Exception:
         pass
-    return table_names
+    return table_names, schema_prefix
+
+
+def drop_schemas_by_prefix(db_params: dict, schema_prefix: str) -> bool:
+    """Drop all schemas matching the given prefix pattern.
+
+    This ensures old schemas with different hashes are removed.
+    Example: drops all schemas matching 'turogfriluftsruter_*'
+
+    Args:
+        db_params: Database connection parameters
+        schema_prefix: Schema prefix to match (e.g., 'turogfriluftsruter')
+
+    Returns:
+        True if successful, False otherwise
+    """
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    # Build psql command
+    cmd = ['psql']
+    if db_params.get('host'):
+        cmd.extend(['-h', db_params['host']])
+    if db_params.get('port'):
+        cmd.extend(['-p', str(db_params['port'])])
+    cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q', '-t'])
+
+    # Query for schemas matching the prefix pattern
+    # Exclude system schemas
+    find_schemas_sql = f"""
+        SELECT nspname
+        FROM pg_namespace
+        WHERE nspname LIKE '{schema_prefix}_%'
+        AND nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
+        ORDER BY nspname;
+    """
+
+    try:
+        result = subprocess.run(
+            cmd,
+            input=find_schemas_sql,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        # Parse schema names from output (one per line, trimmed)
+        schema_names = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+
+        if not schema_names:
+            return True  # No schemas to drop
+
+        print(f"  Fant {len(schema_names)} schema(er) med prefix '{schema_prefix}': {', '.join(schema_names)}")
+
+        # Drop each schema (CASCADE will drop all tables in the schema)
+        drop_sql = '; '.join([f'DROP SCHEMA IF EXISTS "{name}" CASCADE' for name in schema_names]) + ';'
+
+        # Remove -t flag for drop command (we want to see output)
+        drop_cmd = cmd[:-1]  # Remove -t flag
+
+        drop_result = subprocess.run(
+            drop_cmd,
+            input=drop_sql,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        print(f"  ✓ Slettet {len(schema_names)} schema(er)")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        print(f"  ⚠ Kunne ikke slette schemas: {e.stderr}", file=sys.stderr)
+        return False
 
 
 def drop_tables(db_params: dict, table_names: List[str]) -> bool:
@@ -192,14 +307,24 @@ def drop_tables(db_params: dict, table_names: List[str]) -> bool:
         return False
 
 
-def extract_table_names_from_zip_sql(zip_path: Path, sql_file_in_zip: str) -> List[str]:
-    """Extract table names from SQL file in ZIP."""
+def extract_table_names_from_zip_sql(zip_path: Path, sql_file_in_zip: str) -> tuple[List[str], Optional[str]]:
+    """Extract table names and schema prefix from SQL file in ZIP.
+
+    Returns:
+        Tuple of (table_names, schema_prefix)
+    """
     table_names = []
+    schema_prefix = None
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             with zip_ref.open(sql_file_in_zip) as f:
                 # Read first 1MB to find CREATE TABLE statements
                 content = f.read(1024 * 1024).decode('utf-8', errors='ignore')
+
+                # Extract schema prefix
+                schema_prefix = extract_schema_prefix_from_sql(content)
+
+                # Extract table names
                 pattern = r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:(\w+)\.)?(\w+)'
                 matches = re.findall(pattern, content, re.IGNORECASE)
                 for schema, table in matches:
@@ -209,7 +334,7 @@ def extract_table_names_from_zip_sql(zip_path: Path, sql_file_in_zip: str) -> Li
                         table_names.append(table)
     except Exception:
         pass
-    return table_names
+    return table_names, schema_prefix
 
 
 def load_postgis_sql_from_zip_stream(
@@ -224,19 +349,32 @@ def load_postgis_sql_from_zip_stream(
         return False
 
     if drop_tables_flag:
-        print("==> Sletter eksisterende tabeller ...")
-        all_table_names = []
-        for sql_file in sql_files:
-            table_names = extract_table_names_from_zip_sql(zip_path, sql_file)
-            all_table_names.extend(table_names)
+        print("==> Sletter eksisterende data ...")
 
-        if all_table_names:
-            unique_tables = list(set(all_table_names))
-            print(f"  Sletter {len(unique_tables)} tabell(er): {', '.join(unique_tables)}")
-            if drop_tables(db_params, unique_tables):
-                print("  ✓ Tabeller slettet")
-            else:
-                print("  ⚠ Kunne ikke slette alle tabeller (fortsetter likevel)")
+        # Extract schema prefix from SQL files
+        schema_prefix = None
+        all_table_names = []
+
+        for sql_file in sql_files:
+            table_names, prefix = extract_table_names_from_zip_sql(zip_path, sql_file)
+            all_table_names.extend(table_names)
+            if prefix and not schema_prefix:
+                schema_prefix = prefix
+
+        # First, drop all schemas matching the prefix (handles hash changes)
+        if schema_prefix:
+            print(f"  Sletter alle schemas med prefix '{schema_prefix}_*' ...")
+            drop_schemas_by_prefix(db_params, schema_prefix)
+        else:
+            # Fallback: drop individual tables if we can't find prefix
+            print("  Kunne ikke finne schema prefix, sletter individuelle tabeller ...")
+            if all_table_names:
+                unique_tables = list(set(all_table_names))
+                print(f"  Sletter {len(unique_tables)} tabell(er): {', '.join(unique_tables)}")
+                if drop_tables(db_params, unique_tables):
+                    print("  ✓ Tabeller slettet")
+                else:
+                    print("  ⚠ Kunne ikke slette alle tabeller (fortsetter likevel)")
 
     env = os.environ.copy()
     if db_params.get('password'):
@@ -282,19 +420,32 @@ def load_postgis_sql_from_zip_stream(
 def load_postgis_sql(db_params: dict, sql_files: List[Path], drop_tables_flag: bool) -> bool:
     """Load PostGIS SQL files."""
     if drop_tables_flag:
-        print("==> Sletter eksisterende tabeller ...")
-        all_table_names = []
-        for sql_file in sql_files:
-            table_names = extract_table_names_from_sql(sql_file)
-            all_table_names.extend(table_names)
+        print("==> Sletter eksisterende data ...")
 
-        if all_table_names:
-            unique_tables = list(set(all_table_names))
-            print(f"  Sletter {len(unique_tables)} tabell(er): {', '.join(unique_tables)}")
-            if drop_tables(db_params, unique_tables):
-                print("  ✓ Tabeller slettet")
-            else:
-                print("  ⚠ Kunne ikke slette alle tabeller (fortsetter likevel)")
+        # Extract schema prefix from SQL files
+        schema_prefix = None
+        all_table_names = []
+
+        for sql_file in sql_files:
+            table_names, prefix = extract_table_names_from_sql(sql_file)
+            all_table_names.extend(table_names)
+            if prefix and not schema_prefix:
+                schema_prefix = prefix
+
+        # First, drop all schemas matching the prefix (handles hash changes)
+        if schema_prefix:
+            print(f"  Sletter alle schemas med prefix '{schema_prefix}_*' ...")
+            drop_schemas_by_prefix(db_params, schema_prefix)
+        else:
+            # Fallback: drop individual tables if we can't find prefix
+            print("  Kunne ikke finne schema prefix, sletter individuelle tabeller ...")
+            if all_table_names:
+                unique_tables = list(set(all_table_names))
+                print(f"  Sletter {len(unique_tables)} tabell(er): {', '.join(unique_tables)}")
+                if drop_tables(db_params, unique_tables):
+                    print("  ✓ Tabeller slettet")
+                else:
+                    print("  ⚠ Kunne ikke slette alle tabeller (fortsetter likevel)")
 
     # Load SQL files
     env = os.environ.copy()
@@ -339,9 +490,14 @@ def load_gml_from_zip_stream(
     zip_path: Path,
     gml_files: List[str],
     table_name: str,
-    target_srid: Optional[int]
+    target_srid: Optional[int],
+    append: bool = False
 ) -> bool:
-    """Load GML files directly from ZIP using GDAL virtual file system (/vsizip/)."""
+    """Load GML files directly from ZIP using GDAL virtual file system (/vsizip/).
+
+    Args:
+        append: If True, append to existing table instead of overwriting
+    """
     if not check_ogr2ogr():
         print("Feil: ogr2ogr ikke funnet. Installer GDAL:", file=sys.stderr)
         return False
@@ -350,19 +506,31 @@ def load_gml_from_zip_stream(
     if db_params.get('password'):
         env['PGPASSWORD'] = db_params['password']
 
+    # When host is None, unset PGHOST to ensure Unix socket is used
+    if db_params.get('host') is None:
+        env.pop('PGHOST', None)
+        env.pop('PGPORT', None)
+
     # Build connection string
-    host = db_params.get('host') or 'localhost'
-    port = db_params.get('port') or '5432'
-    conn_str = (
-        f"PG:host={host} "
-        f"port={port} "
-        f"user={db_params['user']} "
-        f"dbname={db_params['database']}"
-    )
+    # When host is None, omit host/port to use Unix socket (peer auth)
+    # When host is set, use TCP/IP connection
+    conn_parts = []
+    if db_params.get('host'):
+        conn_parts.append(f"host={db_params['host']}")
+        if db_params.get('port'):
+            conn_parts.append(f"port={db_params['port']}")
+    # If host is None, don't include host/port - ogr2ogr will use Unix socket
+
+    conn_parts.append(f"user={db_params['user']}")
+    conn_parts.append(f"dbname={db_params['database']}")
+
     if db_params.get('password'):
-        conn_str += f" password={db_params['password']}"
+        conn_parts.append(f"password={db_params['password']}")
+
+    conn_str = "PG:" + " ".join(conn_parts)
 
     success_count = 0
+    is_first_file = not append  # First file if not appending
     for gml_file in gml_files:
         print(f"  -> Laster {gml_file} (direkte fra ZIP via /vsizip/) ...")
 
@@ -378,9 +546,19 @@ def load_gml_from_zip_stream(
             '-nln', table_name,
             '-lco', 'GEOMETRY_NAME=geom',
             '-lco', 'SPATIAL_INDEX=GIST',
-            '-overwrite',
-            '-progress'
+            '-lco', 'LAUNDER=YES',  # Better column name handling for complex GML
+            '-lco', 'FID=ogc_fid',  # Ensure unique feature ID column
+            '-lco', 'PROMOTE_TO_MULTI=YES',  # Convert nested structures to arrays to avoid duplicate columns
+            '-progress',
+            '-skipfailures'  # Skip rows with errors (e.g., duplicate column names)
         ]
+
+        # Use -overwrite for first file, -append for subsequent files
+        if is_first_file:
+            cmd.append('-overwrite')
+            is_first_file = False
+        else:
+            cmd.append('-append')
 
         if target_srid:
             cmd.extend(['-t_srs', f'EPSG:{target_srid}'])
@@ -406,8 +584,12 @@ def load_gml_from_zip_stream(
     return success_count > 0
 
 
-def load_gml_files(db_params: dict, gml_files: List[Path], table_name: str, target_srid: Optional[int]) -> bool:
-    """Load GML files using ogr2ogr."""
+def load_gml_files(db_params: dict, gml_files: List[Path], table_name: str, target_srid: Optional[int], append: bool = False) -> bool:
+    """Load GML files using ogr2ogr.
+
+    Args:
+        append: If True, append to existing table instead of overwriting
+    """
     if not check_ogr2ogr():
         print("Feil: ogr2ogr ikke funnet. Installer GDAL:", file=sys.stderr)
         print("  Ubuntu/Debian: sudo apt-get install gdal-bin", file=sys.stderr)
@@ -418,19 +600,31 @@ def load_gml_files(db_params: dict, gml_files: List[Path], table_name: str, targ
     if db_params.get('password'):
         env['PGPASSWORD'] = db_params['password']
 
+    # When host is None, unset PGHOST to ensure Unix socket is used
+    if db_params.get('host') is None:
+        env.pop('PGHOST', None)
+        env.pop('PGPORT', None)
+
     # Build connection string
-    host = db_params.get('host') or 'localhost'
-    port = db_params.get('port') or '5432'
-    conn_str = (
-        f"PG:host={host} "
-        f"port={port} "
-        f"user={db_params['user']} "
-        f"dbname={db_params['database']}"
-    )
+    # When host is None, omit host/port to use Unix socket (peer auth)
+    # When host is set, use TCP/IP connection
+    conn_parts = []
+    if db_params.get('host'):
+        conn_parts.append(f"host={db_params['host']}")
+        if db_params.get('port'):
+            conn_parts.append(f"port={db_params['port']}")
+    # If host is None, don't include host/port - ogr2ogr will use Unix socket
+
+    conn_parts.append(f"user={db_params['user']}")
+    conn_parts.append(f"dbname={db_params['database']}")
+
     if db_params.get('password'):
-        conn_str += f" password={db_params['password']}"
+        conn_parts.append(f"password={db_params['password']}")
+
+    conn_str = "PG:" + " ".join(conn_parts)
 
     success_count = 0
+    is_first_file = not append  # First file if not appending
     for gml_file in gml_files:
         print(f"  -> Laster {gml_file.name} ...")
 
@@ -442,9 +636,19 @@ def load_gml_files(db_params: dict, gml_files: List[Path], table_name: str, targ
             '-nln', table_name,
             '-lco', 'GEOMETRY_NAME=geom',
             '-lco', 'SPATIAL_INDEX=GIST',
-            '-overwrite',  # Overwrite existing table
-            '-progress'
+            '-lco', 'LAUNDER=YES',  # Better column name handling for complex GML
+            '-lco', 'FID=ogc_fid',  # Ensure unique feature ID column
+            '-lco', 'PROMOTE_TO_MULTI=YES',  # Convert nested structures to arrays to avoid duplicate columns
+            '-progress',
+            '-skipfailures'  # Skip rows with errors (e.g., duplicate column names)
         ]
+
+        # Use -overwrite for first file, -append for subsequent files
+        if is_first_file:
+            cmd.append('-overwrite')
+            is_first_file = False
+        else:
+            cmd.append('-append')
 
         # Add SRID transformation if specified
         if target_srid:
@@ -477,7 +681,8 @@ def load_dataset(
     table_name: Optional[str] = None,
     target_srid: Optional[int] = None,
     drop_tables: bool = False,
-    stream: bool = True
+    stream: bool = True,
+    append: bool = False
 ) -> bool:
     """Load dataset from ZIP file into PostGIS database.
 
@@ -488,6 +693,7 @@ def load_dataset(
         target_srid: Target SRID for transformation (default: 25833)
         drop_tables: Drop existing tables before loading (PostGIS SQL only)
         stream: If True, load directly from ZIP without extracting (default: True)
+        append: If True, append to existing table instead of overwriting (GML only)
 
     Returns:
         True if successful, False otherwise
@@ -541,8 +747,10 @@ def load_dataset(
             elif format_type == 'GML':
                 print(f"    Tabell: {table_name}")
                 print(f"    Transformering til EPSG:{target_srid}")
+                if append:
+                    print(f"    Modus: Legger til eksisterende tabell")
 
-                if load_gml_from_zip_stream(db_params, zip_path, files_in_zip, table_name, target_srid):
+                if load_gml_from_zip_stream(db_params, zip_path, files_in_zip, table_name, target_srid, append):
                     print(f"==> Ferdig. {len(files_in_zip)} GML-fil(er) lastet inn (uten ekstraksjon)")
                     print(f"    Tabell: {table_name}")
                     return True
@@ -589,7 +797,7 @@ def load_dataset(
             print(f"    Tabell: {table_name}")
             print(f"    Transformering til EPSG:{target_srid}")
 
-            if load_gml_files(db_params, files, table_name, target_srid):
+            if load_gml_files(db_params, files, table_name, target_srid, append):
                 print(f"==> Ferdig. {len(files)} GML-fil(er) lastet inn")
                 print(f"    Tabell: {table_name}")
                 return True

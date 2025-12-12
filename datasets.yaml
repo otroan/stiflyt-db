@@ -1,5 +1,5 @@
 # Configuration file for downloading Kartverket/Geonorge datasets
-# Generated for: turrutebasen (PostGIS), teig (PostGIS), stedsnavn (GML)
+# Generated for: turrutebasen (PostGIS), teig (PostGIS), stedsnavn (GML), fkb_traktorvegsti (GML)
 
 - name: turrutebasen
   dataset: "Turrutebasen PostGIS-format"
@@ -21,4 +21,13 @@
   utm_zone: 4258  # EPSG:4258 (WGS84) - GML uses geographic coordinates
   area_filter: Norge  # Nationwide data only
   output_dir: ./data/stedsnavn
+
+- name: fkb_traktorvegsti
+  dataset: "FKB-TraktorvegSti GML-format"
+  format: GML
+  utm_zone: 5973  # EPSG:5973 (ETRS89 / UTM zone 33N) - Available: 5972, 5973, 5975
+  # Note: FKB-TraktorvegSti is organized by municipality, not as a single nationwide file
+  # Leave area_filter empty to download all municipalities, or specify specific areas
+  area_filter: ""  # Empty = all municipalities, or specify: "Oslo", "Bergen", etc.
+  output_dir: ./data/fkb_traktorvegsti
 
