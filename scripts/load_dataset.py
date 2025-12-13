@@ -549,6 +549,9 @@ def load_gml_from_zip_stream(
             '-lco', 'LAUNDER=YES',  # Better column name handling for complex GML
             '-lco', 'FID=ogc_fid',  # Ensure unique feature ID column
             '-lco', 'PROMOTE_TO_MULTI=YES',  # Convert nested structures to arrays to avoid duplicate columns
+            '-lco', 'EXPLODE_COLLECTIONS=YES',  # Explode collections into separate features to avoid duplicate column names
+            '-splitlistfields',  # Split list fields into separate columns
+            '-maxsubfields', '10',  # Maximum number of subfields to create from list fields
             '-progress',
             '-skipfailures'  # Skip rows with errors (e.g., duplicate column names)
         ]
@@ -639,6 +642,9 @@ def load_gml_files(db_params: dict, gml_files: List[Path], table_name: str, targ
             '-lco', 'LAUNDER=YES',  # Better column name handling for complex GML
             '-lco', 'FID=ogc_fid',  # Ensure unique feature ID column
             '-lco', 'PROMOTE_TO_MULTI=YES',  # Convert nested structures to arrays to avoid duplicate columns
+            '-lco', 'EXPLODE_COLLECTIONS=YES',  # Explode collections into separate features to avoid duplicate column names
+            '-splitlistfields',  # Split list fields into separate columns
+            '-maxsubfields', '10',  # Maximum number of subfields to create from list fields
             '-progress',
             '-skipfailures'  # Skip rows with errors (e.g., duplicate column names)
         ]

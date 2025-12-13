@@ -18,7 +18,7 @@
 - name: stedsnavn
   dataset: "Stedsnavn (komplett SSR) GML-format"
   format: GML
-  utm_zone: 4258  # EPSG:4258 (WGS84) - GML uses geographic coordinates
+  utm_zone: 25833  # EPSG:25833 (UTM zone 33N) - Transform to match nodes SRID for spatial matching
   area_filter: Norge  # Nationwide data only
   output_dir: ./data/stedsnavn
 
