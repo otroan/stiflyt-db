@@ -15,6 +15,8 @@ Environment variables:
 import os
 import sys
 import argparse
+from pathlib import Path
+from datetime import datetime
 from typing import Dict, List, Set, Tuple, Optional
 from collections import defaultdict
 
@@ -486,13 +488,116 @@ def print_qa_report(links: List[Dict], total_segments: int, used_segments: Set[i
     print("="*60)
 
 
+def setup_logging(log_dir: Path) -> Path:
+    """Setup logging directory and return log file path."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = log_dir / f"build_links_{timestamp}.log"
+    return log_file
+
+
+def log(message: str, log_file: Optional[Path] = None, also_print: bool = True):
+    """Log message to file and optionally print."""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    log_line = f"[{timestamp}] {message}\n"
+    if log_file:
+        with open(log_file, 'a') as f:
+            f.write(log_line)
+    if also_print:
+        print(message)
+
+
+def validate_prerequisites(conn, schema: str, log_file: Optional[Path] = None) -> bool:
+    """Validate that required tables exist before building links."""
+    try:
+        if PSYCOPG_VERSION == 2:
+            with conn.cursor() as cur:
+                # Check for required tables
+                cur.execute("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = %s
+                      AND table_name IN ('nodes', 'fotrute', 'anchor_nodes')
+                """, (schema,))
+                tables = [row[0] for row in cur.fetchall()]
+
+                if len(tables) < 3:
+                    missing = set(['nodes', 'fotrute', 'anchor_nodes']) - set(tables)
+                    log(f"✗ Missing required tables: {', '.join(missing)}", log_file)
+                    return False
+
+                # Check that tables have data
+                for table in ['nodes', 'fotrute', 'anchor_nodes']:
+                    # Use parameterized query with identifier quoting for safety
+                    from psycopg2 import sql
+                    query = sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
+                        sql.Identifier(schema),
+                        sql.Identifier(table)
+                    )
+                    cur.execute(query)
+                    count = cur.fetchone()[0]
+                    if count == 0:
+                        log(f"✗ Table {schema}.{table} is empty", log_file)
+                        return False
+                    log(f"  ✓ Table {schema}.{table}: {count:,} rows", log_file)
+
+                return True
+        else:
+            # Similar logic for psycopg3
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = %s
+                      AND table_name IN ('nodes', 'fotrute', 'anchor_nodes')
+                """, (schema,))
+                tables = [row[0] for row in cur.fetchall()]
+
+                if len(tables) < 3:
+                    missing = set(['nodes', 'fotrute', 'anchor_nodes']) - set(tables)
+                    log(f"✗ Missing required tables: {', '.join(missing)}", log_file)
+                    return False
+
+                for table in ['nodes', 'fotrute', 'anchor_nodes']:
+                    # Use parameterized query with identifier quoting for safety
+                    from psycopg import sql
+                    query = sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
+                        sql.Identifier(schema),
+                        sql.Identifier(table)
+                    )
+                    cur.execute(query)
+                    count = cur.fetchone()[0]
+                    if count == 0:
+                        log(f"✗ Table {schema}.{table} is empty", log_file)
+                        return False
+                    log(f"  ✓ Table {schema}.{table}: {count:,} rows", log_file)
+
+                return True
+    except Exception as e:
+        log(f"✗ Error validating prerequisites: {e}", log_file)
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description='Build links from segments and anchor nodes')
     parser.add_argument('--schema', type=str, help='Schema name (default: auto-detect turrutebasen)')
+    parser.add_argument('--log-dir', type=Path, default=Path('./logs'),
+                       help='Directory for log files (default: ./logs)')
+    parser.add_argument('--skip-validation', action='store_true',
+                       help='Skip prerequisite validation (not recommended)')
     args = parser.parse_args()
 
+    # Setup logging
+    log_file = setup_logging(args.log_dir)
+    log("=== Starting build-links ===", log_file)
+    log(f"Log file: {log_file}", log_file)
+
     # Connect to database
-    conn = get_db_connection()
+    try:
+        conn = get_db_connection()
+    except Exception as e:
+        log(f"✗ Failed to connect to database: {e}", log_file)
+        sys.exit(1)
 
     try:
         # Find or use schema
@@ -501,36 +606,100 @@ def main():
         else:
             schema = find_schema(conn)
             if not schema:
-                print("Error: Could not find turrutebasen schema. Use --schema to specify.", file=sys.stderr)
+                log("✗ Could not find turrutebasen schema. Use --schema to specify.", log_file)
                 sys.exit(1)
 
-        print(f"Using schema: {schema}")
+        log(f"Using schema: {schema}", log_file)
+
+        # Validate prerequisites
+        if not args.skip_validation:
+            log("==> Validating prerequisites...", log_file)
+            if not validate_prerequisites(conn, schema, log_file):
+                log("✗ Prerequisites validation failed - aborting", log_file)
+                sys.exit(1)
+            log("  ✓ Prerequisites validated", log_file)
 
         # Create tables
-        create_tables(conn, schema)
+        log("==> Creating link tables...", log_file)
+        try:
+            create_tables(conn, schema)
+            log("  ✓ Tables created", log_file)
+        except Exception as e:
+            log(f"✗ Failed to create tables: {e}", log_file)
+            sys.exit(1)
 
         # Load data
-        anchor_nodes = load_anchor_nodes(conn, schema)
-        segments_dict, adjacency = load_segments(conn, schema)
+        log("==> Loading data...", log_file)
+        try:
+            anchor_nodes = load_anchor_nodes(conn, schema)
+            log(f"  ✓ Loaded {len(anchor_nodes)} anchor nodes", log_file)
 
-        if not segments_dict:
-            print("Warning: No segments found", file=sys.stderr)
-            return
+            segments_dict, adjacency = load_segments(conn, schema)
+            log(f"  ✓ Loaded {len(segments_dict)} segments", log_file)
+
+            if not segments_dict:
+                log("⚠ Warning: No segments found", log_file)
+                sys.exit(0)  # Not an error, just nothing to do
+        except Exception as e:
+            log(f"✗ Failed to load data: {e}", log_file)
+            sys.exit(1)
 
         # Build links
-        print("\nBuilding links...")
-        links, link_segments, errors = build_links(segments_dict, adjacency, anchor_nodes)
+        log("==> Building links...", log_file)
+        try:
+            links, link_segments, errors = build_links(segments_dict, adjacency, anchor_nodes)
+            log(f"  ✓ Built {len(links)} links from {len(link_segments)} segments", log_file)
+            if errors:
+                log(f"  ⚠ Found {len(errors)} errors (dangling/branch/loop)", log_file)
+        except Exception as e:
+            log(f"✗ Failed to build links: {e}", log_file)
+            sys.exit(1)
 
         # Insert into database
-        insert_links(conn, schema, links, link_segments)
+        log("==> Inserting links into database...", log_file)
+        try:
+            insert_links(conn, schema, links, link_segments)
+            log("  ✓ Links inserted", log_file)
+        except Exception as e:
+            log(f"✗ Failed to insert links: {e}", log_file)
+            sys.exit(1)
 
         # Update geometries
-        update_link_geometries(conn, schema)
+        log("==> Updating link geometries...", log_file)
+        try:
+            update_link_geometries(conn, schema)
+            log("  ✓ Link geometries updated", log_file)
+        except Exception as e:
+            log(f"✗ Failed to update geometries: {e}", log_file)
+            sys.exit(1)
 
         # Print QA report
         used_segment_ids = {ls['segment_id'] for ls in link_segments}
+        log("==> QA Report", log_file)
         print_qa_report(links, len(segments_dict), used_segment_ids, errors)
 
+        # Also log QA report to file
+        with open(log_file, 'a') as f:
+            f.write("\n" + "="*60 + "\n")
+            f.write("QA REPORT\n")
+            f.write("="*60 + "\n")
+            f.write(f"Total links:              {len(links)}\n")
+            f.write(f"Total segments:           {len(segments_dict)}\n")
+            f.write(f"Segments used:            {len(used_segment_ids)}\n")
+            f.write(f"Segments unused:          {len(segments_dict) - len(used_segment_ids)}\n")
+            f.write(f"Errors (dangling/branch/loop): {len(errors)}\n")
+            f.write("="*60 + "\n")
+
+        log("=== Build-links completed successfully ===", log_file)
+
+    except KeyboardInterrupt:
+        log("⚠ Interrupted by user", log_file)
+        sys.exit(130)
+    except Exception as e:
+        log(f"✗ Unexpected error: {e}", log_file)
+        import traceback
+        log(traceback.format_exc(), log_file, also_print=False)
+        sys.exit(1)
     finally:
         conn.close()
 

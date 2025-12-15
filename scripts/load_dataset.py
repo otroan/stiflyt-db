@@ -62,6 +62,13 @@ def detect_format(extract_dir: Path) -> tuple[str, List[Path]]:
     if gml_files:
         return ('GML', gml_files)
 
+    # Check for FileGDB datasets (.gdb directories or .gdbtable files)
+    gdb_dirs = set(p for p in extract_dir.rglob('*.gdb') if p.is_dir())
+    gdbtable_parents = set(p.parent for p in extract_dir.rglob('*.gdbtable'))
+    gdb_dirs |= gdbtable_parents
+    if gdb_dirs:
+        return ('FGDB', sorted(gdb_dirs))
+
     # Could not detect format
     return (None, [])
 
@@ -77,6 +84,7 @@ def detect_format_from_zip(zip_path: Path) -> tuple[Optional[str], List[str]]:
 
     sql_files = []
     gml_files = []
+    gdb_entries = []
 
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
@@ -85,6 +93,8 @@ def detect_format_from_zip(zip_path: Path) -> tuple[Optional[str], List[str]]:
                     sql_files.append(name)
                 elif name.endswith('.gml'):
                     gml_files.append(name)
+                elif '.gdb/' in name or name.endswith('.gdbtable'):
+                    gdb_entries.append(name)
     except zipfile.BadZipFile:
         return None, []
 
@@ -92,6 +102,8 @@ def detect_format_from_zip(zip_path: Path) -> tuple[Optional[str], List[str]]:
         return ('PostGIS', sql_files)
     elif gml_files:
         return ('GML', gml_files)
+    elif gdb_entries:
+        return ('FGDB', gdb_entries)
     else:
         return None, []
 
@@ -307,6 +319,315 @@ def drop_tables(db_params: dict, table_names: List[str]) -> bool:
         return False
 
 
+def sanitize_identifier(name: str) -> str:
+    """Sanitize a string to be a valid PostgreSQL identifier (lowercase, alnum + underscore)."""
+    return re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
+
+
+def ensure_schema_exists(db_params: dict, schema: str) -> bool:
+    """Create schema if not exists."""
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    cmd = ['psql']
+    if db_params.get('host'):
+        cmd.extend(['-h', db_params['host']])
+    if db_params.get('port'):
+        cmd.extend(['-p', str(db_params['port'])])
+    cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q'])
+
+    sql = f"CREATE SCHEMA IF NOT EXISTS {schema};"
+
+    try:
+        subprocess.run(
+            cmd,
+            input=sql,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"  ⚠ Kunne ikke opprette schema {schema}: {e.stderr}", file=sys.stderr)
+        return False
+
+
+def move_schema_objects(db_params: dict, source_schema: str, target_schema: str = 'public') -> bool:
+    """Move tables and sequences from source_schema to target_schema, dropping conflicts."""
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    cmd = ['psql']
+    if db_params.get('host'):
+        cmd.extend(['-h', db_params['host']])
+    if db_params.get('port'):
+        cmd.extend(['-p', str(db_params['port'])])
+    cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q'])
+
+    sql = f"""
+DO $$
+DECLARE
+    r record;
+BEGIN
+    -- Move tables
+    FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = '{source_schema}'
+    LOOP
+        EXECUTE format('DROP TABLE IF EXISTS %I.%I CASCADE;', '{target_schema}', r.tablename);
+        EXECUTE format('ALTER TABLE %I.%I SET SCHEMA %I;', '{source_schema}', r.tablename, '{target_schema}');
+    END LOOP;
+
+    -- Move sequences
+    FOR r IN SELECT sequence_name FROM information_schema.sequences WHERE sequence_schema = '{source_schema}'
+    LOOP
+        EXECUTE format('DROP SEQUENCE IF EXISTS %I.%I CASCADE;', '{target_schema}', r.sequence_name);
+        EXECUTE format('ALTER SEQUENCE %I.%I SET SCHEMA %I;', '{source_schema}', r.sequence_name, '{target_schema}');
+    END LOOP;
+END$$;
+
+DROP SCHEMA IF EXISTS {source_schema} CASCADE;
+"""
+
+    try:
+        subprocess.run(
+            cmd,
+            input=sql,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"  ⚠ Kunne ikke flytte objekter fra schema {source_schema}: {e.stderr}", file=sys.stderr)
+        return False
+
+
+def analyze_tables(db_params: dict, tables: Optional[List[str]] = None, schemas: Optional[List[str]] = None, use_vacuum: bool = False) -> bool:
+    """Run ANALYZE or VACUUM ANALYZE on tables to update planner statistics.
+
+    Args:
+        db_params: Database connection parameters
+        tables: List of table names (schema.table or just table for public schema)
+        schemas: List of schema names to analyze all tables in (if tables not specified)
+        use_vacuum: If True, use VACUUM ANALYZE (slower but also reclaims space)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    cmd = ['psql']
+    if db_params.get('host'):
+        cmd.extend(['-h', db_params['host']])
+    if db_params.get('port'):
+        cmd.extend(['-p', str(db_params['port'])])
+    cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q'])
+
+    if tables:
+        # Analyze specific tables
+        analyze_cmd = 'VACUUM ANALYZE' if use_vacuum else 'ANALYZE'
+        print(f"==> Kjører {analyze_cmd} på {len(tables)} tabell(er) ...")
+
+        for table in tables:
+            sql = f"{analyze_cmd} {table};"
+            try:
+                subprocess.run(
+                    cmd,
+                    input=sql,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+            except subprocess.CalledProcessError as e:
+                print(f"  ⚠ Kunne ikke kjøre {analyze_cmd} på {table}: {e.stderr}", file=sys.stderr)
+                # Continue with other tables
+
+        print(f"  ✓ {analyze_cmd} fullført")
+        return True
+
+    elif schemas:
+        # Analyze all tables in specified schemas
+        analyze_cmd = 'VACUUM ANALYZE' if use_vacuum else 'ANALYZE'
+        print(f"==> Kjører {analyze_cmd} på alle tabeller i {len(schemas)} schema(er) ...")
+
+        schema_list = ", ".join([f"'{s}'" for s in schemas])
+        sql = f"""
+DO $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT schemaname, tablename
+        FROM pg_tables
+        WHERE schemaname IN ({schema_list})
+          AND schemaname NOT IN ('pg_catalog', 'information_schema')
+    LOOP
+        EXECUTE format('{analyze_cmd} %I.%I;', r.schemaname, r.tablename);
+    END LOOP;
+END$$;
+"""
+        try:
+            subprocess.run(
+                cmd,
+                input=sql,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            print(f"  ✓ {analyze_cmd} fullført")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"  ⚠ Kunne ikke kjøre {analyze_cmd}: {e.stderr}", file=sys.stderr)
+            return False
+
+    else:
+        # Analyze public schema by default
+        analyze_cmd = 'VACUUM ANALYZE' if use_vacuum else 'ANALYZE'
+        print(f"==> Kjører {analyze_cmd} på alle tabeller i public schema ...")
+
+        sql = f"""
+DO $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT tablename
+        FROM pg_tables
+        WHERE schemaname = 'public'
+    LOOP
+        EXECUTE format('{analyze_cmd} public.%I;', r.tablename);
+    END LOOP;
+END$$;
+"""
+        try:
+            subprocess.run(
+                cmd,
+                input=sql,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            print(f"  ✓ {analyze_cmd} fullført")
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"  ⚠ Kunne ikke kjøre {analyze_cmd}: {e.stderr}", file=sys.stderr)
+            return False
+
+
+def create_missing_spatial_indexes(db_params: dict, schemas: Optional[List[str]] = None) -> bool:
+    """Create GIST indexes CONCURRENTLY for geometry columns that lack a spatial index.
+
+    Uses CONCURRENTLY to avoid locking tables during index creation, allowing
+    reads and writes to continue. This is slower but non-blocking.
+    """
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    base_cmd = ['psql']
+    if db_params.get('host'):
+        base_cmd.extend(['-h', db_params['host']])
+    if db_params.get('port'):
+        base_cmd.extend(['-p', str(db_params['port'])])
+    base_cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q', '-t'])
+
+    schema_filter = ""
+    if schemas:
+        schema_list = ", ".join([f"'{s}'" for s in schemas])
+        schema_filter = f"AND f_table_schema IN ({schema_list})"
+
+    # First, get list of missing indexes (query outside transaction)
+    query_sql = f"""
+SELECT format('%I.%I', f_table_schema, f_table_name) AS table_name,
+       f_geometry_column AS geomcol,
+       format('idx_%s_%s_gist', f_table_name, f_geometry_column) AS idx_name
+FROM public.geometry_columns
+WHERE 1=1 {schema_filter}
+  AND NOT EXISTS (
+      SELECT 1 FROM pg_indexes
+      WHERE schemaname = f_table_schema
+        AND tablename = f_table_name
+        AND indexname = format('idx_%s_%s_gist', f_table_name, f_geometry_column)
+  )
+ORDER BY f_table_schema, f_table_name, f_geometry_column;
+"""
+
+    try:
+        # Get list of indexes to create
+        result = subprocess.run(
+            base_cmd,
+            input=query_sql,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        # Parse results (tab-separated: table_name, geomcol, idx_name)
+        indexes_to_create = []
+        for line in result.stdout.strip().split('\n'):
+            if not line.strip():
+                continue
+            parts = line.split('\t')
+            if len(parts) >= 3:
+                table_name = parts[0].strip()
+                geomcol = parts[1].strip()
+                idx_name = parts[2].strip()
+                indexes_to_create.append((table_name, geomcol, idx_name))
+
+        if not indexes_to_create:
+            print("  ⊙ Alle spatial-indekser eksisterer allerede")
+            return True
+
+        print(f"  → Bygger {len(indexes_to_create)} spatial-indeks(er) CONCURRENTLY...")
+
+        # Create each index CONCURRENTLY (must be outside transaction)
+        # Remove -t flag for index creation (we want to see progress)
+        create_cmd = base_cmd[:-1]  # Remove -t flag
+
+        success_count = 0
+        failed_count = 0
+
+        for table_name, geomcol, idx_name in indexes_to_create:
+            # CREATE INDEX CONCURRENTLY cannot be run in a transaction
+            create_sql = f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {idx_name} ON {table_name} USING GIST ({geomcol});"
+
+            try:
+                subprocess.run(
+                    create_cmd,
+                    input=create_sql,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                success_count += 1
+                if success_count % 10 == 0:
+                    print(f"    → {success_count}/{len(indexes_to_create)} indekser bygget...")
+            except subprocess.CalledProcessError as e:
+                failed_count += 1
+                print(f"    ⚠ Kunne ikke lage indeks {idx_name} på {table_name}: {e.stderr}", file=sys.stderr)
+
+        if success_count > 0:
+            print(f"  ✓ {success_count} spatial-indeks(er) bygget")
+        if failed_count > 0:
+            print(f"  ⚠ {failed_count} indeks(er) feilet", file=sys.stderr)
+
+        return failed_count == 0
+
+    except subprocess.CalledProcessError as e:
+        print(f"  ⚠ Kunne ikke hente liste over manglende indekser: {e.stderr}", file=sys.stderr)
+        return False
+
+
 def extract_table_names_from_zip_sql(zip_path: Path, sql_file_in_zip: str) -> tuple[List[str], Optional[str]]:
     """Extract table names and schema prefix from SQL file in ZIP.
 
@@ -491,6 +812,7 @@ def load_gml_from_zip_stream(
     gml_files: List[str],
     table_name: str,
     target_srid: Optional[int],
+    staging_schema: Optional[str],
     append: bool = False
 ) -> bool:
     """Load GML files directly from ZIP using GDAL virtual file system (/vsizip/).
@@ -538,12 +860,16 @@ def load_gml_from_zip_stream(
         # Format: /vsizip/path/to/zip.zip/path/to/file.gml
         vsi_path = f"/vsizip/{zip_path}/{gml_file}"
 
+        target_name = table_name
+        if staging_schema:
+            target_name = f"{staging_schema}.{table_name}"
+
         cmd = [
             'ogr2ogr',
             '-f', 'PostgreSQL',
             conn_str,
             vsi_path,
-            '-nln', table_name,
+            '-nln', target_name,
             '-lco', 'GEOMETRY_NAME=geom',
             '-lco', 'SPATIAL_INDEX=GIST',
             '-lco', 'LAUNDER=YES',  # Better column name handling for complex GML
@@ -587,7 +913,14 @@ def load_gml_from_zip_stream(
     return success_count > 0
 
 
-def load_gml_files(db_params: dict, gml_files: List[Path], table_name: str, target_srid: Optional[int], append: bool = False) -> bool:
+def load_gml_files(
+    db_params: dict,
+    gml_files: List[Path],
+    table_name: str,
+    target_srid: Optional[int],
+    staging_schema: Optional[str],
+    append: bool = False
+) -> bool:
     """Load GML files using ogr2ogr.
 
     Args:
@@ -631,12 +964,16 @@ def load_gml_files(db_params: dict, gml_files: List[Path], table_name: str, targ
     for gml_file in gml_files:
         print(f"  -> Laster {gml_file.name} ...")
 
+        target_name = table_name
+        if staging_schema:
+            target_name = f"{staging_schema}.{table_name}"
+
         cmd = [
             'ogr2ogr',
             '-f', 'PostgreSQL',
             conn_str,
             str(gml_file),
-            '-nln', table_name,
+            '-nln', target_name,
             '-lco', 'GEOMETRY_NAME=geom',
             '-lco', 'SPATIAL_INDEX=GIST',
             '-lco', 'LAUNDER=YES',  # Better column name handling for complex GML
@@ -657,6 +994,81 @@ def load_gml_files(db_params: dict, gml_files: List[Path], table_name: str, targ
             cmd.append('-append')
 
         # Add SRID transformation if specified
+        if target_srid:
+            cmd.extend(['-t_srs', f'EPSG:{target_srid}'])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                env=env,
+                capture_output=True,
+                text=True
+            )
+
+            if result.returncode == 0:
+                success_count += 1
+                print(f"     ✓ Lastet")
+            else:
+                print(f"     ✗ Feil: {result.stderr}", file=sys.stderr)
+                return False
+        except FileNotFoundError:
+            print("     ✗ ogr2ogr ikke funnet", file=sys.stderr)
+            return False
+
+    return success_count > 0
+
+
+def load_fgdb(db_params: dict, gdb_dirs: List[Path], target_srid: Optional[int], staging_schema: Optional[str]) -> bool:
+    """Load FileGDB directories using ogr2ogr."""
+    if not check_ogr2ogr():
+        print("Feil: ogr2ogr ikke funnet. Installer GDAL:", file=sys.stderr)
+        print("  Ubuntu/Debian: sudo apt-get install gdal-bin", file=sys.stderr)
+        print("  macOS: brew install gdal", file=sys.stderr)
+        return False
+
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    # When host is None, unset PGHOST to ensure Unix socket is used
+    if db_params.get('host') is None:
+        env.pop('PGHOST', None)
+        env.pop('PGPORT', None)
+
+    # Build connection string
+    conn_parts = []
+    if db_params.get('host'):
+        conn_parts.append(f"host={db_params['host']}")
+        if db_params.get('port'):
+            conn_parts.append(f"port={db_params['port']}")
+    conn_parts.append(f"user={db_params['user']}")
+    conn_parts.append(f"dbname={db_params['database']}")
+    if db_params.get('password'):
+        conn_parts.append(f"password={db_params['password']}")
+    conn_str = "PG:" + " ".join(conn_parts)
+
+    success_count = 0
+    for gdb_dir in gdb_dirs:
+        print(f"  -> Laster {gdb_dir} (FileGDB) ...")
+
+        cmd = [
+            'ogr2ogr',
+            '-f', 'PostgreSQL',
+            conn_str,
+            str(gdb_dir),
+            '-nlt', 'PROMOTE_TO_MULTI',
+            '-lco', 'GEOMETRY_NAME=geom',
+            '-lco', 'FID=ogc_fid',
+            '--config', 'PG_USE_COPY', 'YES',  # hurtigere innlasting
+            '-gt', '50000',  # større batcher til COPY
+            '-progress',
+            '-skipfailures',
+            '-overwrite'
+        ]
+
+        if staging_schema:
+            cmd.extend(['-lco', f"SCHEMA={staging_schema}"])
+
         if target_srid:
             cmd.extend(['-t_srs', f'EPSG:{target_srid}'])
 
@@ -740,12 +1152,30 @@ def load_dataset(
                 return False
             print("  ✓ PostGIS extension klar")
 
+            staging_schema = None
+            if format_type == 'GML':
+                staging_schema = f"staging_{sanitize_identifier(table_name)}"
+                if not ensure_schema_exists(db_params, staging_schema):
+                    return False
+            elif format_type == 'FGDB':
+                staging_schema = f"staging_{sanitize_identifier(zip_path.stem)}"
+                if not ensure_schema_exists(db_params, staging_schema):
+                    return False
+
             # Load based on format (streaming)
             print(f"==> Laster data direkte fra ZIP inn i database '{db_params['database']}' ...")
 
             if format_type == 'PostGIS':
                 if load_postgis_sql_from_zip_stream(db_params, zip_path, files_in_zip, drop_tables):
                     print(f"==> Ferdig. {len(files_in_zip)} SQL-fil(er) lastet inn (uten ekstraksjon)")
+                    # Extract schema prefix to analyze imported tables
+                    table_names, schema_prefix = extract_table_names_from_zip_sql(zip_path, files_in_zip[0])
+                    if table_names:
+                        # Analyze imported tables
+                        analyze_tables(db_params, tables=table_names)
+                    else:
+                        # Fallback: analyze public schema
+                        analyze_tables(db_params, schemas=['public'])
                     return True
                 else:
                     print("  ⚠ Streaming feilet, prøver med ekstraksjon...", file=sys.stderr)
@@ -756,13 +1186,21 @@ def load_dataset(
                 if append:
                     print(f"    Modus: Legger til eksisterende tabell")
 
-                if load_gml_from_zip_stream(db_params, zip_path, files_in_zip, table_name, target_srid, append):
+                if load_gml_from_zip_stream(db_params, zip_path, files_in_zip, table_name, target_srid, staging_schema, append):
                     print(f"==> Ferdig. {len(files_in_zip)} GML-fil(er) lastet inn (uten ekstraksjon)")
                     print(f"    Tabell: {table_name}")
+                    if staging_schema:
+                        print(f"==> Flytter staging-schema {staging_schema} til public ...")
+                        move_schema_objects(db_params, staging_schema, 'public')
+                    # Analyze imported table
+                    analyze_tables(db_params, tables=[f'public.{table_name}'])
                     return True
                 else:
                     print("  ⚠ Streaming feilet, prøver med ekstraksjon...", file=sys.stderr)
                     # Fall through to extraction method
+            elif format_type == 'FGDB':
+                print("  ℹ FGDB oppdaget. Streaming støttes ikke, prøver med ekstraksjon ...")
+                # fall through to extraction
 
     # Fallback: Extract ZIP file (original method)
     extract_dir = zip_path.parent / f"{zip_path.stem}_extracted"
@@ -776,11 +1214,21 @@ def load_dataset(
 
         if not format_type:
             print(f"Feil: Kunne ikke detektere format i {zip_path}", file=sys.stderr)
-            print("Forventet enten SQL-filer (.sql) eller GML-filer (.gml)", file=sys.stderr)
+            print("Forventet SQL (.sql), GML (.gml) eller FileGDB (.gdb)", file=sys.stderr)
             return False
 
         print(f"  ✓ Detektert format: {format_type}")
         print(f"  ✓ Fant {len(files)} fil(er)")
+
+        staging_schema = None
+        if format_type == 'GML':
+            staging_schema = f"staging_{sanitize_identifier(table_name)}"
+            if not ensure_schema_exists(db_params, staging_schema):
+                return False
+        elif format_type == 'FGDB':
+            staging_schema = f"staging_{sanitize_identifier(zip_path.stem)}"
+            if not ensure_schema_exists(db_params, staging_schema):
+                return False
 
         # Ensure PostGIS extension
         print(f"==> Sjekker PostGIS extension i database '{db_params['database']}' ...")
@@ -794,6 +1242,14 @@ def load_dataset(
         if format_type == 'PostGIS':
             if load_postgis_sql(db_params, files, drop_tables):
                 print(f"==> Ferdig. {len(files)} SQL-fil(er) lastet inn")
+                # Extract table names from first SQL file
+                table_names, schema_prefix = extract_table_names_from_sql(files[0])
+                if table_names:
+                    # Analyze imported tables
+                    analyze_tables(db_params, tables=table_names)
+                else:
+                    # Fallback: analyze public schema
+                    analyze_tables(db_params, schemas=['public'])
                 return True
             else:
                 print("Feil: Kunne ikke laste inn SQL-filer", file=sys.stderr)
@@ -803,12 +1259,32 @@ def load_dataset(
             print(f"    Tabell: {table_name}")
             print(f"    Transformering til EPSG:{target_srid}")
 
-            if load_gml_files(db_params, files, table_name, target_srid, append):
+            if load_gml_files(db_params, files, table_name, target_srid, staging_schema, append):
                 print(f"==> Ferdig. {len(files)} GML-fil(er) lastet inn")
                 print(f"    Tabell: {table_name}")
+                if staging_schema:
+                    print(f"==> Flytter staging-schema {staging_schema} til public ...")
+                    move_schema_objects(db_params, staging_schema, 'public')
+                # Analyze imported table
+                analyze_tables(db_params, tables=[f'public.{table_name}'])
                 return True
             else:
                 print("Feil: Kunne ikke laste inn GML-filer", file=sys.stderr)
+                return False
+
+        elif format_type == 'FGDB':
+            if load_fgdb(db_params, files, target_srid, staging_schema):
+                print(f"==> Ferdig. {len(files)} FGDB-katalog(er) lastet inn")
+                print("==> Flytter staging-schema til public ...")
+                if staging_schema:
+                    move_schema_objects(db_params, staging_schema, 'public')
+                print("==> Bygger manglende spatial-indekser ...")
+                create_missing_spatial_indexes(db_params)
+                # Analyze imported tables (analyze public schema after move)
+                analyze_tables(db_params, schemas=['public'])
+                return True
+            else:
+                print("Feil: Kunne ikke laste inn FGDB", file=sys.stderr)
                 return False
 
         return False

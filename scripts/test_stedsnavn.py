@@ -99,15 +99,27 @@ def get_table_info(conn, table_name: str = 'stedsnavn', schema: str = 'public') 
         row_count = cur.fetchone()['count']
 
         # Get geometry column info
-        cur.execute("""
-            SELECT
-                f_geometry_column as geom_column,
-                coord_dimension,
-                srid,
-                type
-            FROM geometry_columns
-            WHERE f_table_schema = %s AND f_table_name = %s
-        """, (schema, table_name))
+        # For stedsnavn, geometry is in sted_posisjon table, not in stedsnavn itself
+        if table_name == 'stedsnavn':
+            cur.execute("""
+                SELECT
+                    f_geometry_column as geom_column,
+                    coord_dimension,
+                    srid,
+                    type
+                FROM geometry_columns
+                WHERE f_table_schema = %s AND f_table_name = 'sted_posisjon'
+            """, (schema,))
+        else:
+            cur.execute("""
+                SELECT
+                    f_geometry_column as geom_column,
+                    coord_dimension,
+                    srid,
+                    type
+                FROM geometry_columns
+                WHERE f_table_schema = %s AND f_table_name = %s
+            """, (schema, table_name))
         geom_info = cur.fetchone()
 
         return {
@@ -118,47 +130,69 @@ def get_table_info(conn, table_name: str = 'stedsnavn', schema: str = 'public') 
 
 
 def search_by_name(conn, name: str, exact: bool = False, limit: int = 10, schema: str = 'public', table: str = 'stedsnavn'):
-    """Search stedsnavn by name."""
+    """Search stedsnavn by name.
+
+    Stedsnavn has a normalized structure:
+    - stedsnavn table: metadata (objid, sted_fk, navnestatus, etc.)
+    - skrivemate table: actual name (komplettskrivemate) linked via stedsnavn.objid = skrivemate.stedsnavn_fk
+    - sted_posisjon: geometry linked via stedsnavn.sted_fk = sted_posisjon.stedsnummer
+    """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         if exact:
-            # Try to find a column that contains the name
-            # Common column names in stedsnavn: navn, stedsnavn, name, etc.
+            # Join with skrivemate to get the actual name
             query = f"""
-                SELECT *
-                FROM {schema}.{table}
-                WHERE navn = %s OR stedsnavn = %s OR name = %s
+                SELECT
+                    sn.*,
+                    sm.komplettskrivemate as navn,
+                    sp.geom,
+                    sp.navneobjekttype
+                FROM {schema}.{table} sn
+                JOIN {schema}.skrivemate sm ON sn.objid = sm.stedsnavn_fk
+                LEFT JOIN {schema}.sted_posisjon sp ON sn.sted_fk = sp.stedsnummer
+                WHERE sm.komplettskrivemate = %s
                 LIMIT %s
             """
-            cur.execute(query, (name, name, name, limit))
+            cur.execute(query, (name, limit))
         else:
-            # Partial match - try common name columns
+            # Partial match - search in skrivemate.komplettskrivemate
             query = f"""
-                SELECT *
-                FROM {schema}.{table}
-                WHERE
-                    navn ILIKE %s OR
-                    stedsnavn ILIKE %s OR
-                    name ILIKE %s OR
-                    navneobjekttype ILIKE %s
+                SELECT
+                    sn.*,
+                    sm.komplettskrivemate as navn,
+                    sp.geom,
+                    sp.navneobjekttype
+                FROM {schema}.{table} sn
+                JOIN {schema}.skrivemate sm ON sn.objid = sm.stedsnavn_fk
+                LEFT JOIN {schema}.sted_posisjon sp ON sn.sted_fk = sp.stedsnummer
+                WHERE sm.komplettskrivemate ILIKE %s
                 LIMIT %s
             """
             pattern = f'%{name}%'
-            cur.execute(query, (pattern, pattern, pattern, pattern, limit))
+            cur.execute(query, (pattern, limit))
 
         return cur.fetchall()
 
 
 def search_by_bbox(conn, minx: float, miny: float, maxx: float, maxy: float,
                    srid: int = 25833, limit: int = 10, schema: str = 'public', table: str = 'stedsnavn'):
-    """Search stedsnavn within a bounding box."""
+    """Search stedsnavn within a bounding box.
+
+    Joins with sted_posisjon for geometry and skrivemate for name.
+    """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Create bounding box geometry
-        # Note: Assuming geometry column is named 'geom'
+        # Join with sted_posisjon for geometry and skrivemate for name
         query = f"""
-            SELECT *
-            FROM {schema}.{table}
+            SELECT
+                sn.*,
+                sm.komplettskrivemate as navn,
+                sp.geom,
+                sp.navneobjekttype
+            FROM {schema}.{table} sn
+            JOIN {schema}.skrivemate sm ON sn.objid = sm.stedsnavn_fk
+            JOIN {schema}.sted_posisjon sp ON sn.sted_fk = sp.stedsnummer
             WHERE ST_Intersects(
-                geom,
+                sp.geom,
                 ST_MakeEnvelope(%s, %s, %s, %s, %s)
             )
             LIMIT %s
@@ -169,16 +203,25 @@ def search_by_bbox(conn, minx: float, miny: float, maxx: float, maxy: float,
 
 def search_by_point(conn, x: float, y: float, radius: float,
                    srid: int = 25833, limit: int = 10, schema: str = 'public', table: str = 'stedsnavn'):
-    """Search stedsnavn within radius of a point."""
+    """Search stedsnavn within radius of a point.
+
+    Joins with sted_posisjon for geometry and skrivemate for name.
+    """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         # Create point and buffer
+        # Join with sted_posisjon for geometry and skrivemate for name
         query = f"""
             SELECT
-                *,
-                ST_Distance(geom, ST_SetSRID(ST_MakePoint(%s, %s), %s)) as distance
-            FROM {schema}.{table}
+                sn.*,
+                sm.komplettskrivemate as navn,
+                sp.geom,
+                sp.navneobjekttype,
+                ST_Distance(sp.geom, ST_SetSRID(ST_MakePoint(%s, %s), %s)) as distance
+            FROM {schema}.{table} sn
+            JOIN {schema}.skrivemate sm ON sn.objid = sm.stedsnavn_fk
+            JOIN {schema}.sted_posisjon sp ON sn.sted_fk = sp.stedsnummer
             WHERE ST_DWithin(
-                geom,
+                sp.geom,
                 ST_SetSRID(ST_MakePoint(%s, %s), %s),
                 %s
             )
@@ -190,28 +233,21 @@ def search_by_point(conn, x: float, y: float, radius: float,
 
 
 def show_sample_data(conn, limit: int = 5, schema: str = 'public', table: str = 'stedsnavn'):
-    """Show sample data from stedsnavn table."""
+    """Show sample data from stedsnavn table.
+
+    Joins with skrivemate for name and sted_posisjon for geometry.
+    """
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        # Get column names first
-        cur.execute("""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s
-            ORDER BY ordinal_position
-        """, (schema, table))
-        columns = [row['column_name'] for row in cur.fetchall()]
-
-        # Build query - convert geometry to text for display
-        select_cols = []
-        for col in columns:
-            if col == 'geom' or col.startswith('geometry'):
-                select_cols.append(f"ST_AsText({col}) as {col}")
-            else:
-                select_cols.append(col)
-
+        # Join with skrivemate for name and sted_posisjon for geometry
         query = f"""
-            SELECT {', '.join(select_cols)}
-            FROM {schema}.{table}
+            SELECT
+                sn.*,
+                sm.komplettskrivemate as navn,
+                ST_AsText(sp.geom) as geom,
+                sp.navneobjekttype
+            FROM {schema}.{table} sn
+            JOIN {schema}.skrivemate sm ON sn.objid = sm.stedsnavn_fk
+            LEFT JOIN {schema}.sted_posisjon sp ON sn.sted_fk = sp.stedsnummer
             LIMIT %s
         """
         cur.execute(query, (limit,))

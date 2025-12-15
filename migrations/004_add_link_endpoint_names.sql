@@ -14,8 +14,9 @@ DO $$
 DECLARE
     schema_name TEXT;
     stedsnavn_schema TEXT := 'public';
-    stedsnavn_table TEXT := 'stedsnavn';
     stedsnavn_exists BOOLEAN;
+    skrivemate_exists BOOLEAN;
+    sted_posisjon_exists BOOLEAN;
 BEGIN
     -- Find the schema with prefix 'turogfriluftsruter_'
     SELECT nspname INTO schema_name
@@ -33,19 +34,45 @@ BEGIN
     RAISE NOTICE 'Adding names to anchor nodes in schema: %', schema_name;
 
     -- Check if stedsnavn table exists
+    -- Stedsnavn has a normalized structure:
+    -- - stedsnavn table: metadata (objid, sted_fk, navnestatus, etc.)
+    -- - skrivemate table: actual name (komplettskrivemate) linked via stedsnavn.objid = skrivemate.stedsnavn_fk
+    -- - sted_posisjon/sted_omrade/sted_senterlinje/sted_multipunkt: geometry linked via stedsnavn.sted_fk = sted_*.stedsnummer
     SELECT EXISTS (
         SELECT 1 FROM information_schema.tables
-        WHERE table_schema = stedsnavn_schema AND table_name = stedsnavn_table
+        WHERE table_schema = stedsnavn_schema AND table_name = 'stedsnavn'
     ) INTO stedsnavn_exists;
 
     IF NOT stedsnavn_exists THEN
-        RAISE WARNING 'Table %.% does not exist. Will only use ruteinfopunkt for endpoint names.', stedsnavn_schema, stedsnavn_table;
+        RAISE WARNING 'Stedsnavn table not found in %. Will only use ruteinfopunkt for endpoint names.', stedsnavn_schema;
+    ELSE
+        -- Check if required related tables exist
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = stedsnavn_schema AND table_name = 'skrivemate'
+        ) INTO skrivemate_exists;
+
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = stedsnavn_schema AND table_name = 'sted_posisjon'
+        ) INTO sted_posisjon_exists;
+
+        IF NOT skrivemate_exists THEN
+            RAISE WARNING 'skrivemate table not found in %. Will only use ruteinfopunkt for endpoint names.', stedsnavn_schema;
+            stedsnavn_exists := FALSE;
+        ELSIF NOT sted_posisjon_exists THEN
+            RAISE WARNING 'sted_posisjon table not found in %. Will only use ruteinfopunkt for endpoint names.', stedsnavn_schema;
+            stedsnavn_exists := FALSE;
+        ELSE
+            RAISE NOTICE 'Found stedsnavn structure: stedsnavn + skrivemate + sted_posisjon';
+        END IF;
     END IF;
 
     -- Step 1: Create materialized view for node names
     -- This matches nodes to ruteinfopunkt and stedsnavn using spatial proximity
     IF stedsnavn_exists THEN
             -- Version with both ruteinfopunkt and stedsnavn
+            -- Stedsnavn structure: stedsnavn (metadata) -> skrivemate (name) + sted_posisjon (geometry)
             EXECUTE format('
                 DROP MATERIALIZED VIEW IF EXISTS %I.node_names CASCADE;
 
@@ -65,27 +92,35 @@ BEGIN
                     FROM %I.nodes n
                     JOIN %I.ruteinfopunkt rp ON ST_DWithin(n.geom, rp.posisjon, 100)
                     WHERE rp.posisjon IS NOT NULL
+                      AND rp.tilrettelegging IN (
+                          ''12'', -- Hytte
+                          ''42'', -- Hytte betjent
+                          ''43'', -- Hytte selvbetjent
+                          ''44'', -- Hytte ubetjent
+                          ''22''  -- Parkeringsplass
+                      )
                     ORDER BY n.id, ST_Distance(n.geom, rp.posisjon)
                 ),
                 node_stedsnavn AS (
                     -- Match nodes to stedsnavn within 200m (only if no ruteinfopunkt match)
+                    -- Join: stedsnavn -> skrivemate (for name) -> sted_posisjon (for geometry)
                     SELECT DISTINCT ON (n.id)
                         n.id as node_id,
                         sn.objid as stedsnavn_objid,
-                        -- Try common name columns in stedsnavn
-                        COALESCE(
-                            NULLIF(sn.navn, ''''),
-                            NULLIF(sn.stedsnavn, ''''),
-                            NULLIF(sn.name, '''')
-                        ) as navn,
-                        ST_Distance(n.geom, sn.geom) as distance_m,
+                        -- Get name from skrivemate table
+                        NULLIF(TRIM(sm.komplettskrivemate), '''') as navn,
+                        ST_Distance(n.geom, sp.geom) as distance_m,
                         ''stedsnavn'' as navn_kilde
                     FROM %I.nodes n
                     LEFT JOIN node_ruteinfopunkt nrp ON n.id = nrp.node_id
-                    JOIN %I.%I sn ON ST_DWithin(n.geom, sn.geom, 200)
+                    JOIN %I.stedsnavn sn ON sn.sted_fk IS NOT NULL
+                    JOIN %I.skrivemate sm ON sn.objid = sm.stedsnavn_fk
+                    JOIN %I.sted_posisjon sp ON sn.sted_fk = sp.stedsnummer
                     WHERE nrp.node_id IS NULL  -- Only if no ruteinfopunkt match
-                      AND sn.geom IS NOT NULL
-                    ORDER BY n.id, ST_Distance(n.geom, sn.geom)
+                      AND ST_DWithin(n.geom, sp.geom, 500)
+                      AND sm.komplettskrivemate IS NOT NULL
+                      AND sp.geom IS NOT NULL
+                    ORDER BY n.id, ST_Distance(n.geom, sp.geom)
                 )
                 -- Combine ruteinfopunkt and stedsnavn matches, prioritizing ruteinfopunkt
                 SELECT
@@ -101,7 +136,8 @@ BEGIN
                     navn_kilde,
                     distance_m
                 FROM node_stedsnavn;
-            ', schema_name, schema_name, schema_name, schema_name, schema_name, stedsnavn_schema, stedsnavn_table);
+            ', schema_name, schema_name, schema_name, schema_name, schema_name,
+               stedsnavn_schema, stedsnavn_schema, stedsnavn_schema);
         ELSE
             -- Version with only ruteinfopunkt
             EXECUTE format('
@@ -166,10 +202,21 @@ BEGIN
             END as anchor_type,
             rm.ruteinfopunkt_objid,
             rm.distance_m as ruteinfopunkt_distance_m,
-            -- Add name information from node_names
-            nn.navn,
-            nn.navn_kilde,
-            nn.distance_m as navn_distance_m
+            -- Add name information from node_names, with coordinate-based fallback
+            COALESCE(
+                nn.navn,
+                ''UTM25833 '' ||
+                ROUND(ST_X(n.geom))::text || '' '' ||
+                ROUND(ST_Y(n.geom))::text
+            ) as navn,
+            CASE
+                WHEN nn.navn IS NOT NULL THEN nn.navn_kilde
+                ELSE ''koordinat''
+            END as navn_kilde,
+            CASE
+                WHEN nn.navn IS NOT NULL THEN nn.distance_m
+                ELSE NULL::double precision
+            END as navn_distance_m
         FROM %I.node_degree n
         LEFT JOIN ruteinfopunkt_matches rm ON n.node_id = rm.node_id
         LEFT JOIN %I.node_names nn ON n.node_id = nn.node_id

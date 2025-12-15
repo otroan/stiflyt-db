@@ -134,6 +134,121 @@ def check_table_exists_and_modified(conn, table_name: str) -> Tuple[bool, Option
         return False, None
 
 
+def verify_imported_data(database: str, configs: List[Dict[str, Any]], log_file: Path) -> bool:
+    """Verify that imported tables have data (row count > 0).
+
+    Args:
+        database: Database name
+        configs: List of dataset configurations
+        log_file: Log file path
+
+    Returns:
+        True if all checks pass, False otherwise
+    """
+    db_params = get_db_connection_params()
+    db_params['database'] = database
+    conn = connect_db(db_params)
+
+    if not conn:
+        log("  ✗ Cannot connect to database for sanity checks", log_file)
+        return False
+
+    all_checks_passed = True
+
+    try:
+        with conn.cursor() as cur:
+            for cfg in configs:
+                name = cfg.get('name', 'unknown')
+                format_type = cfg.get('format', '')
+
+                # Determine expected table names based on format and dataset name
+                expected_tables = []
+
+                if format_type == 'PostGIS':
+                    # For PostGIS, we need to check what tables were actually created
+                    # This is tricky without knowing the schema prefix
+                    # Check for tables in public schema that might be from this dataset
+                    cur.execute("""
+                        SELECT tablename
+                        FROM pg_tables
+                        WHERE schemaname = 'public'
+                        ORDER BY tablename
+                    """)
+                    all_tables = [row[0] for row in cur.fetchall()]
+
+                    # For known datasets, check specific table patterns
+                    if 'teig' in name.lower() or 'matrikkel' in name.lower():
+                        # Matrikkel typically has tables like teig, eiendom, etc.
+                        expected_tables = [t for t in all_tables if any(keyword in t.lower() for keyword in ['teig', 'eiendom', 'matrikkel'])]
+                    elif 'turrute' in name.lower() or 'friluft' in name.lower():
+                        # Turrutebasen has tables in a schema with prefix
+                        # Check for common table names
+                        expected_tables = [t for t in all_tables if any(keyword in t.lower() for keyword in ['rute', 'friluft', 'tur'])]
+                    else:
+                        # For other PostGIS datasets, check all tables in public
+                        expected_tables = all_tables[:5]  # Limit to first 5 tables
+
+                elif format_type == 'GML':
+                    # GML uses a single table with dataset name
+                    table_name = name.lower().replace('-', '_').replace(' ', '_')
+                    expected_tables = [table_name]
+
+                elif format_type == 'FGDB':
+                    # FGDB can have multiple tables, check common patterns
+                    table_name = name.lower().replace('-', '_').replace(' ', '_')
+                    # Check for tables that might be from this dataset
+                    cur.execute("""
+                        SELECT tablename
+                        FROM pg_tables
+                        WHERE schemaname = 'public'
+                          AND (tablename LIKE %s OR tablename LIKE %s)
+                        ORDER BY tablename
+                    """, (f'%{table_name}%', f'%{name.lower()}%'))
+                    expected_tables = [row[0] for row in cur.fetchall()]
+
+                    # If no specific tables found, check all tables in public
+                    if not expected_tables:
+                        cur.execute("""
+                            SELECT tablename
+                            FROM pg_tables
+                            WHERE schemaname = 'public'
+                            ORDER BY tablename
+                        """)
+                        expected_tables = [row[0] for row in cur.fetchall()][:10]  # Limit to first 10
+
+                # Verify each expected table has data
+                for table in expected_tables:
+                    try:
+                        # Use psycopg2.sql.Identifier for safe identifier quoting
+                        from psycopg2 import sql
+                        query = sql.SQL("SELECT COUNT(*) FROM public.{}").format(
+                            sql.Identifier(table)
+                        )
+                        cur.execute(query)
+                        row_count = cur.fetchone()[0]
+
+                        if row_count == 0:
+                            log(f"    ✗ Table {table} is empty (0 rows)", log_file)
+                            all_checks_passed = False
+                        else:
+                            log(f"    ✓ Table {table}: {row_count:,} rows", log_file)
+                    except Exception as e:
+                        log(f"    ⚠ Could not check table {table}: {e}", log_file)
+                        # Don't fail on this, might be a view or permission issue
+
+                # If no expected tables found, log a warning
+                if not expected_tables:
+                    log(f"    ⚠ No tables found to verify for {name} ({format_type})", log_file)
+
+    except Exception as e:
+        log(f"  ✗ Error during sanity checks: {e}", log_file)
+        all_checks_passed = False
+    finally:
+        conn.close()
+
+    return all_checks_passed
+
+
 def check_import_needed(
     zip_file: Path,
     database: str,
@@ -215,6 +330,56 @@ def check_import_needed(
                 return True, f"ZIP file ({datetime.fromtimestamp(zip_mtime)}) is newer than table ({datetime.fromtimestamp(mod_time)})"
 
             return False, f"Table {table_name} is up-to-date"
+
+        elif format_type == 'FGDB':
+            # For FGDB, we don't know table names in advance without extracting
+            # Check if any tables in public schema are newer than ZIP file
+            # This is a heuristic - if all tables are newer, assume import not needed
+
+            with conn.cursor() as cur:
+                # Get all tables in public schema with their modification times
+                cur.execute("""
+                    SELECT relname,
+                           GREATEST(
+                               COALESCE(stat_last_vacuum, '1970-01-01'::timestamp),
+                               COALESCE(stat_last_autovacuum, '1970-01-01'::timestamp),
+                               COALESCE(stat_last_analyze, '1970-01-01'::timestamp),
+                               COALESCE(stat_last_autoanalyze, '1970-01-01'::timestamp)
+                           ) as mod_time
+                    FROM pg_stat_user_tables
+                    WHERE schemaname = 'public'
+                    ORDER BY mod_time DESC
+                """)
+
+                results = cur.fetchall()
+
+                if not results:
+                    # No tables in public schema, need import
+                    return True, "No tables found in public schema"
+
+                # Check if any table is older than ZIP file
+                # If all tables are newer than ZIP, assume import not needed
+                all_newer = True
+                oldest_table_time = None
+                table_names = []
+
+                for table_name, mod_time in results:
+                    table_names.append(table_name)
+                    if mod_time:
+                        mod_timestamp = mod_time.timestamp()
+                        if oldest_table_time is None or mod_timestamp < oldest_table_time:
+                            oldest_table_time = mod_timestamp
+                        if zip_mtime > mod_timestamp:
+                            all_newer = False
+                            break
+
+                if all_newer and oldest_table_time:
+                    return False, f"All tables in public schema ({len(table_names)} tables) are newer than ZIP file ({datetime.fromtimestamp(zip_mtime)})"
+                elif oldest_table_time:
+                    return True, f"ZIP file ({datetime.fromtimestamp(zip_mtime)}) is newer than oldest table ({datetime.fromtimestamp(oldest_table_time)})"
+                else:
+                    # No modification times available, assume import needed
+                    return True, "Cannot determine table modification times"
 
         else:
             return True, f"Unknown format type: {format_type}"
@@ -348,6 +513,46 @@ def load_gml_dataset(zip_file: Path, database: str, table_name: str, srid: int, 
         return False
 
 
+def load_fgdb_dataset(zip_file: Path, database: str, srid: int, log_file: Path) -> bool:
+    """Load FGDB dataset using unified loader."""
+    try:
+        if zip_file is None:
+            log(f"✗ Feil: zip_file er None", log_file)
+            return False
+
+        if not isinstance(zip_file, Path):
+            zip_file = Path(zip_file)
+
+        zip_file = zip_file.resolve()
+
+        if not zip_file.exists():
+            log(f"✗ Feil: ZIP-fil eksisterer ikke: {zip_file}", log_file)
+            return False
+
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+
+        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+            success = load_dataset(zip_file, database, target_srid=srid)
+
+        stdout_output = stdout_capture.getvalue()
+        stderr_output = stderr_capture.getvalue()
+
+        with open(log_file, 'a') as f:
+            if stdout_output:
+                f.write(stdout_output)
+            if stderr_output:
+                f.write(stderr_output)
+
+        return success
+    except Exception as e:
+        log(f"✗ Failed to load FGDB dataset: {e}", log_file)
+        return False
+
+
 def main():
     """Main function."""
     import argparse
@@ -381,6 +586,20 @@ def main():
     # Load configuration
     configs = load_config(config_path)
     log(f"Found {len(configs)} datasets in configuration", log_file)
+
+    # Log feed URL information for each dataset (from config)
+    log("==> Feed URL configuration:", log_file)
+    for cfg in configs:
+        name = cfg.get('name', 'unknown')
+        dataset_name = cfg.get('dataset', '')
+        format_pref = cfg.get('format', 'PostGIS')
+        feed_url_override = cfg.get('feed_url', None)
+
+        if feed_url_override:
+            log(f"  [{name}] Feed URL override: {feed_url_override}", log_file)
+        else:
+            log(f"  [{name}] Feed URL: will be discovered from catalog (dataset: {dataset_name})", log_file)
+        log(f"  [{name}] Format preference: {format_pref}", log_file)
 
     # Download datasets
     if not download_datasets(config_path, log_file):
@@ -521,6 +740,21 @@ def main():
                     log(f"    ✗ Failed to load {name}", log_file)
                     failed_count += 1
 
+            elif format_type == 'FGDB':
+                if isinstance(utm_zone, int):
+                    srid = utm_zone
+                elif isinstance(utm_zone, str) and utm_zone.isdigit():
+                    srid = int(utm_zone)
+                else:
+                    srid = 25833  # Default
+
+                if load_fgdb_dataset(zip_file, database, srid, log_file):
+                    log(f"    ✓ {name} loaded successfully", log_file)
+                    success_count += 1
+                else:
+                    log(f"    ✗ Failed to load {name}", log_file)
+                    failed_count += 1
+
             else:
                 log(f"    ⚠ Unknown format '{format_type}' - skipping", log_file)
                 failed_count += 1
@@ -529,6 +763,18 @@ def main():
     log("==> Update completed", log_file)
     log(f"  ✓ Successful: {success_count}", log_file)
     log(f"  ✗ Failed: {failed_count}", log_file)
+
+    # Sanity checks: verify imported tables have data before running migrations
+    if success_count > 0:
+        log("==> Running sanity checks on imported data...", log_file)
+        sanity_ok = verify_imported_data(database, configs, log_file)
+        if not sanity_ok:
+            log("  ✗ Sanity checks failed - aborting migrations", log_file)
+            log("  ⚠ Database may be in inconsistent state", log_file)
+            sys.exit(1)
+        log("  ✓ Sanity checks passed", log_file)
+    else:
+        log("  ⊙ No successful imports - skipping sanity checks", log_file)
 
     # Run migrations after data import
     log("==> Running database migrations...", log_file)

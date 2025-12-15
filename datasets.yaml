@@ -16,18 +16,19 @@
   output_dir: ./data/matrikkel
 
 - name: stedsnavn
-  dataset: "Stedsnavn (komplett SSR) GML-format"
-  format: GML
+  dataset: "Stedsnavn (komplett SSR) FGDB-format"
+  format: FGDB
   utm_zone: 25833  # EPSG:25833 (UTM zone 33N) - Transform to match nodes SRID for spatial matching
+  feed_url: "https://nedlasting.geonorge.no/geonorge/ATOM-feeds/Stedsnavn_AtomFeedFGDB.xml"
   area_filter: Norge  # Nationwide data only
   output_dir: ./data/stedsnavn
 
-- name: fkb_traktorvegsti
-  dataset: "FKB-TraktorvegSti GML-format"
-  format: GML
-  utm_zone: 5973  # EPSG:5973 (ETRS89 / UTM zone 33N) - Available: 5972, 5973, 5975
-  # Note: FKB-TraktorvegSti is organized by municipality, not as a single nationwide file
-  # Leave area_filter empty to download all municipalities, or specify specific areas
-  area_filter: ""  # Empty = all municipalities, or specify: "Oslo", "Bergen", etc.
-  output_dir: ./data/fkb_traktorvegsti
+# - name: fkb_traktorvegsti
+#   dataset: "FKB-TraktorvegSti GML-format"
+#   format: GML
+#   utm_zone: 5973  # EPSG:5973 (ETRS89 / UTM zone 33N) - Available: 5972, 5973, 5975
+#   # Note: FKB-TraktorvegSti is organized by municipality, not as a single nationwide file
+#   # Leave area_filter empty to download all municipalities, or specify specific areas
+#   area_filter: ""  # Empty = all municipalities, or specify: "Oslo", "Bergen", etc.
+#   output_dir: ./data/fkb_traktorvegsti
 

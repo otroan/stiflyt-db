@@ -72,6 +72,8 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # Try to import yaml for config file support
 try:
@@ -945,33 +947,30 @@ def load_config_file(config_path: Path) -> List[Dict[str, Any]]:
         sys.exit(1)
 
 
-def download_from_config(config_path: Path) -> None:
-    """Download datasets from configuration file.
+def download_single_dataset(dataset_config: Dict[str, Any], index: int, total: int) -> Tuple[str, bool, int, Optional[str]]:
+    """Download a single dataset from configuration.
 
     Args:
-        config_path: Path to YAML configuration file
+        dataset_config: Dataset configuration dictionary
+        index: Index of this dataset (1-based)
+        total: Total number of datasets
+
+    Returns:
+        Tuple of (name, success, download_count, error_message)
     """
-    configs = load_config_file(config_path)
+    name = dataset_config.get('name', f'dataset_{index}')
+    dataset_name = dataset_config.get('dataset', '')
+    format_pref = dataset_config.get('format', 'PostGIS')
+    utm_zone = dataset_config.get('utm_zone', '25833')
+    area_filter = dataset_config.get('area_filter', 'Norge')
+    area_type = dataset_config.get('area_type', '')
+    output_dir = dataset_config.get('output_dir', f'./data/{name}')
+    feed_url_override = dataset_config.get('feed_url', None)
 
-    if not configs:
-        print("Advarsel: Konfigurasjonsfil er tom.", file=sys.stderr)
-        return
-
-    print(f"==> Laster ned {len(configs)} datasett fra konfigurasjonsfil...\n")
-
-    success_count = 0
-    failed_count = 0
-
-    for i, dataset_config in enumerate(configs, 1):
-        name = dataset_config.get('name', f'dataset_{i}')
-        dataset_name = dataset_config.get('dataset', '')
-        format_pref = dataset_config.get('format', 'PostGIS')
-        utm_zone = dataset_config.get('utm_zone', '25833')
-        area_filter = dataset_config.get('area_filter', 'Norge')
-        area_type = dataset_config.get('area_type', '')
-        output_dir = dataset_config.get('output_dir', f'./data/{name}')
-
-        print(f"[{i}/{len(configs)}] {name}")
+    # Thread-safe print
+    print_lock = threading.Lock()
+    with print_lock:
+        print(f"[{index}/{total}] {name}")
         print(f"  Dataset: {dataset_name}")
         print(f"  Format: {format_pref}")
         print(f"  UTM Zone: {utm_zone}")
@@ -981,61 +980,119 @@ def download_from_config(config_path: Path) -> None:
         print(f"  Output: {output_dir}")
         print()
 
-        try:
-            # Determine format preference
-            format_preference = [format_pref]
-            if format_pref == 'PostGIS':
-                format_preference.extend(['FGDB', 'GML'])
-            elif format_pref == 'FGDB':
-                format_preference.extend(['PostGIS', 'GML'])
-            elif format_pref == 'GML':
-                format_preference.extend(['PostGIS', 'FGDB'])
+    try:
+        # Determine format preference
+        format_preference = [format_pref]
+        if format_pref == 'PostGIS':
+            format_preference.extend(['FGDB', 'GML'])
+        elif format_pref == 'FGDB':
+            format_preference.extend(['PostGIS', 'GML'])
+        elif format_pref == 'GML':
+            format_preference.extend(['PostGIS', 'FGDB'])
 
-            # Get feed URL
-            feed_url, _ = get_atom_feed_url(dataset_name, None, format_preference)
+        # Get feed URL (allow override from config)
+        feed_url, format_detected = get_atom_feed_url(dataset_name, feed_url_override, format_preference)
 
-            # Create output directory
-            outdir = Path(output_dir)
-            outdir.mkdir(parents=True, exist_ok=True)
+        # Log which feed URL is being used
+        with print_lock:
+            if feed_url_override:
+                print(f"  ℹ Feed URL: {feed_url_override} (from config override)")
+            else:
+                print(f"  ℹ Feed URL: {feed_url} (from catalog discovery)")
+            if format_detected:
+                print(f"  ℹ Format detected: {format_detected}")
 
-            # Fetch and parse ATOM feed
-            root = fetch_atom_feed(feed_url)
+        # Create output directory
+        outdir = Path(output_dir)
+        outdir.mkdir(parents=True, exist_ok=True)
 
-            # Extract download URLs (pass parameters directly, no env vars needed)
-            urls = extract_download_urls(root, str(utm_zone), area_filter, area_type if area_type else None)
+        # Fetch and parse ATOM feed
+        root = fetch_atom_feed(feed_url)
 
-            if not urls:
-                print(f"  ⚠ Ingen filer funnet som matcher kriteriene\n")
-                failed_count += 1
-                continue
+        # Extract download URLs (pass parameters directly, no env vars needed)
+        urls = extract_download_urls(root, str(utm_zone), area_filter, area_type if area_type else None)
 
-            print(f"  ✓ Fant {len(urls)} fil(er) som matcher kriteriene")
+        if not urls:
+            with print_lock:
+                print(f"  ⚠ [{name}] Ingen filer funnet som matcher kriteriene\n")
+            return (name, False, 0, "No matching files found")
 
-            # Download files
-            download_count = process_download_urls(urls, outdir, name, str(utm_zone), format_pref)
+        with print_lock:
+            print(f"  ✓ [{name}] Fant {len(urls)} fil(er) som matcher kriteriene")
 
-            if download_count > 0:
-                print(f"  ✓ Ferdig med {name} ({download_count} fil(er) lastet ned)\n")
+        # Download files
+        download_count = process_download_urls(urls, outdir, name, str(utm_zone), format_pref)
+
+        if download_count > 0:
+            with print_lock:
+                print(f"  ✓ [{name}] Ferdig ({download_count} fil(er) lastet ned)\n")
+            return (name, True, download_count, None)
+        else:
+            with print_lock:
+                print(f"  ⚠ [{name}] Ingen nye filer lastet ned\n")
+            return (name, False, 0, "No new files downloaded")
+
+    except Exception as e:
+        error_msg = str(e)
+        with print_lock:
+            print(f"  ✗ [{name}] Feil ved nedlasting: {error_msg}\n", file=sys.stderr)
+        return (name, False, 0, error_msg)
+
+
+def download_from_config(config_path: Path, max_workers: Optional[int] = None) -> None:
+    """Download datasets from configuration file with parallel downloads.
+
+    Args:
+        config_path: Path to YAML configuration file
+        max_workers: Maximum number of parallel downloads (default: number of datasets, max 4)
+    """
+    configs = load_config_file(config_path)
+
+    if not configs:
+        print("Advarsel: Konfigurasjonsfil er tom.", file=sys.stderr)
+        return
+
+    total = len(configs)
+    print(f"==> Laster ned {total} datasett fra konfigurasjonsfil (parallell nedlasting)...\n")
+
+    # Limit parallelism to avoid overwhelming the server or network
+    if max_workers is None:
+        max_workers = min(total, 4)  # Max 4 parallel downloads
+
+    success_count = 0
+    failed_count = 0
+
+    # Use ThreadPoolExecutor for parallel downloads
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all download tasks
+        future_to_config = {
+            executor.submit(download_single_dataset, config, i + 1, total): config
+            for i, config in enumerate(configs)
+        }
+
+        # Process completed downloads as they finish
+        for future in as_completed(future_to_config):
+            name, success, download_count, error_msg = future.result()
+            if success:
                 success_count += 1
             else:
-                print(f"  ⚠ Ingen nye filer lastet ned for {name}\n")
                 failed_count += 1
-
-        except Exception as e:
-            print(f"  ✗ Feil ved nedlasting av {name}: {e}\n", file=sys.stderr)
-            failed_count += 1
 
     # Summary
     print("==> Sammendrag")
     print(f"  ✓ Vellykket: {success_count}")
     print(f"  ✗ Feilet: {failed_count}")
-    print(f"  Total: {len(configs)}")
+    print(f"  Total: {total}")
 
 
 def main():
     """Main function."""
     # Parse arguments
     args = parse_arguments()
+
+    # Local copies for readability
+    dataset_name = args.dataset_name
+    feed_url = args.feed_url
 
     # Handle --config option (batch download from config file)
     if args.config:
@@ -1048,12 +1105,12 @@ def main():
         return
 
     # Get ATOM feed URL
-    atom_feed_url, format_type = get_atom_feed_url(args.dataset_name, args.feed_url, args.format_preference)
+    atom_feed_url, format_type = get_atom_feed_url(dataset_name, feed_url, args.format_preference)
 
     # Determine dataset display name
-    if args.dataset_name:
-        display_name = args.dataset_name
-    elif args.feed_url:
+    if dataset_name:
+        display_name = dataset_name
+    elif feed_url:
         display_name = "custom"
     else:
         display_name = "teig"

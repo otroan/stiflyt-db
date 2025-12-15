@@ -11,7 +11,7 @@ VENV := venv
 PYTHON := $(VENV)/bin/python3
 PIP := $(VENV)/bin/pip
 
-.PHONY: dependencies download-matrikkel create-db ensure-db drop-db load-matrikkel setup-matrikkel reload-matrikkel inspect-matrikkel inspect-wsdl run-api test update-datasets db-status inspect-db run-migrations verify-migration build-links
+.PHONY: dependencies download-matrikkel create-db ensure-db drop-db load-matrikkel setup-matrikkel reload-matrikkel inspect-matrikkel inspect-wsdl run-api test update-datasets db-status inspect-db run-migrations verify-migration build-links cron-update
 
 # Install all required system dependencies (Ubuntu/Debian)
 dependencies:
@@ -157,8 +157,26 @@ verify-migration: $(VENV)
 
 # Build links from segments and anchor nodes
 # Creates links and link_segments tables with topology
+# This is a heavy operation and should be run after data import
 build-links: $(VENV)
-	@$(PYTHON) scripts/build_links.py
+	@echo "==> Building links (this may take a while)..."
+	@$(PYTHON) scripts/build_links.py --log-dir ./logs || (echo "✗ build-links failed - check logs/build_links_*.log" && exit 1)
+
+# Cron-friendly full refresh: download/update datasets, migrations, build links
+# Each step runs independently - if one fails, the next still runs
+# Check logs/ for detailed output
+cron-update: $(VENV)
+	@echo "=== Starting cron-update pipeline ==="
+	@echo "Step 1: Update datasets..."
+	@$(MAKE) update-datasets || (echo "⚠ update-datasets failed - continuing with migrations" && true)
+	@echo ""
+	@echo "Step 2: Run migrations..."
+	@$(MAKE) run-migrations || (echo "⚠ run-migrations failed - continuing with build-links" && true)
+	@echo ""
+	@echo "Step 3: Build links..."
+	@$(MAKE) build-links || (echo "✗ build-links failed" && exit 1)
+	@echo ""
+	@echo "=== cron-update pipeline completed ==="
 
 # Ensure virtual environment exists
 $(VENV):
@@ -172,4 +190,3 @@ $(VENV):
 test:
 	@echo "==> Running tests..."
 	@source venv/bin/activate && pip install -e ".[dev]" > /dev/null 2>&1 && pytest tests/ -v
-
