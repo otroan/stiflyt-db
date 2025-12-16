@@ -434,9 +434,8 @@ def extract_download_urls(
     """Extract download URLs and their last updated timestamps from ATOM feed.
 
     Returns:
-        List of (url, updated_url, updated_timestamp )
+        List of (url, updated_timestamp) tuples
     """
-    """Extract download URLs from ATOM feed entries matching criteria."""
     urls = []
 
     # Find all entries

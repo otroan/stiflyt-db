@@ -24,7 +24,7 @@ import subprocess
 import re
 import argparse
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 
 def get_db_connection_params() -> dict:
@@ -46,7 +46,7 @@ def get_db_connection_params() -> dict:
     }
 
 
-def detect_format(extract_dir: Path) -> tuple[str, List[Path]]:
+def detect_format(extract_dir: Path) -> Tuple[str, List[Path]]:
     """Detect dataset format by examining extracted files.
 
     Returns:
@@ -73,7 +73,7 @@ def detect_format(extract_dir: Path) -> tuple[str, List[Path]]:
     return (None, [])
 
 
-def detect_format_from_zip(zip_path: Path) -> tuple[Optional[str], List[str]]:
+def detect_format_from_zip(zip_path: Path) -> Tuple[Optional[str], List[str]]:
     """Detect dataset format by examining ZIP contents without extracting.
 
     Returns:
@@ -184,7 +184,7 @@ def extract_schema_prefix_from_sql(content: str) -> Optional[str]:
     return None
 
 
-def extract_table_names_from_sql(sql_file: Path) -> tuple[List[str], Optional[str]]:
+def extract_table_names_from_sql(sql_file: Path) -> Tuple[List[str], Optional[str]]:
     """Extract table names and schema prefix from SQL file by looking for CREATE TABLE statements.
 
     Returns:
@@ -628,7 +628,7 @@ ORDER BY f_table_schema, f_table_name, f_geometry_column;
         return False
 
 
-def extract_table_names_from_zip_sql(zip_path: Path, sql_file_in_zip: str) -> tuple[List[str], Optional[str]]:
+def extract_table_names_from_zip_sql(zip_path: Path, sql_file_in_zip: str) -> Tuple[List[str], Optional[str]]:
     """Extract table names and schema prefix from SQL file in ZIP.
 
     Returns:
