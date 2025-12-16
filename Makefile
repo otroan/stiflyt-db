@@ -148,6 +148,7 @@ inspect-db: $(VENV)
 
 # Run database migrations (creates indexes, updates statistics, etc.)
 # Migrations run automatically after update-datasets, but can be run manually
+# Note: build-links runs automatically before migration 003 if needed
 run-migrations: $(VENV)
 	@$(PYTHON) scripts/run_migrations.py $(PGDATABASE)
 
@@ -158,11 +159,14 @@ verify-migration: $(VENV)
 # Build links from segments and anchor nodes
 # Creates links and link_segments tables with topology
 # This is a heavy operation and should be run after data import
+# Note: build-links runs automatically via run-migrations before migration 003
+# This target is for manual execution or when you need to rebuild links separately
 build-links: $(VENV)
 	@echo "==> Building links (this may take a while)..."
 	@$(PYTHON) scripts/build_links.py --log-dir ./logs || (echo "✗ build-links failed - check logs/build_links_*.log" && exit 1)
 
-# Cron-friendly full refresh: download/update datasets, migrations, build links
+# Cron-friendly full refresh: download/update datasets and run migrations
+# Migrations automatically run build-links before migration 003 if needed
 # Each step runs independently - if one fails, the next still runs
 # Check logs/ for detailed output
 cron-update: $(VENV)
@@ -170,11 +174,8 @@ cron-update: $(VENV)
 	@echo "Step 1: Update datasets..."
 	@$(MAKE) update-datasets || (echo "⚠ update-datasets failed - continuing with migrations" && true)
 	@echo ""
-	@echo "Step 2: Run migrations..."
-	@$(MAKE) run-migrations || (echo "⚠ run-migrations failed - continuing with build-links" && true)
-	@echo ""
-	@echo "Step 3: Build links..."
-	@$(MAKE) build-links || (echo "✗ build-links failed" && exit 1)
+	@echo "Step 2: Run migrations (includes build-links if needed)..."
+	@$(MAKE) run-migrations || (echo "✗ run-migrations failed" && exit 1)
 	@echo ""
 	@echo "=== cron-update pipeline completed ==="
 

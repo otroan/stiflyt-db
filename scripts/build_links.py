@@ -508,69 +508,120 @@ def log(message: str, log_file: Optional[Path] = None, also_print: bool = True):
 
 
 def validate_prerequisites(conn, schema: str, log_file: Optional[Path] = None) -> bool:
-    """Validate that required tables exist before building links."""
+    """Validate that required tables and materialized views exist before building links.
+
+    Note: anchor_nodes is a materialized view, not a table, so we need to check
+    both information_schema.tables and pg_matviews.
+    """
     try:
         if PSYCOPG_VERSION == 2:
             with conn.cursor() as cur:
-                # Check for required tables
+                # Check for tables (nodes, fotrute)
                 cur.execute("""
                     SELECT table_name
                     FROM information_schema.tables
                     WHERE table_schema = %s
-                      AND table_name IN ('nodes', 'fotrute', 'anchor_nodes')
+                      AND table_name IN ('nodes', 'fotrute')
                 """, (schema,))
-                tables = [row[0] for row in cur.fetchall()]
+                tables = {row[0] for row in cur.fetchall()}
 
-                if len(tables) < 3:
-                    missing = set(['nodes', 'fotrute', 'anchor_nodes']) - set(tables)
-                    log(f"✗ Missing required tables: {', '.join(missing)}", log_file)
+                # Check for materialized views (anchor_nodes)
+                cur.execute("""
+                    SELECT matviewname
+                    FROM pg_matviews
+                    WHERE schemaname = %s
+                      AND matviewname = 'anchor_nodes'
+                """, (schema,))
+                matviews = {row[0] for row in cur.fetchall()}
+
+                # Combine found objects
+                found_objects = tables | matviews
+                required = {'nodes', 'fotrute', 'anchor_nodes'}
+                missing = required - found_objects
+
+                if missing:
+                    missing_list = []
+                    for name in missing:
+                        if name == 'anchor_nodes':
+                            missing_list.append(f"{name} (materialized view)")
+                        else:
+                            missing_list.append(f"{name} (table)")
+                    log(f"✗ Missing required objects: {', '.join(missing_list)}", log_file)
+                    if 'anchor_nodes' in missing:
+                        log(f"  Run 'make run-migrations' to create anchor_nodes materialized view", log_file)
                     return False
 
-                # Check that tables have data
-                for table in ['nodes', 'fotrute', 'anchor_nodes']:
+                # Check that objects have data
+                for name in ['nodes', 'fotrute', 'anchor_nodes']:
                     # Use parameterized query with identifier quoting for safety
                     from psycopg2 import sql
                     query = sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
                         sql.Identifier(schema),
-                        sql.Identifier(table)
+                        sql.Identifier(name)
                     )
                     cur.execute(query)
                     count = cur.fetchone()[0]
                     if count == 0:
-                        log(f"✗ Table {schema}.{table} is empty", log_file)
+                        obj_type = 'materialized view' if name == 'anchor_nodes' else 'table'
+                        log(f"✗ {obj_type.capitalize()} {schema}.{name} is empty", log_file)
                         return False
-                    log(f"  ✓ Table {schema}.{table}: {count:,} rows", log_file)
+                    obj_type = 'materialized view' if name == 'anchor_nodes' else 'table'
+                    log(f"  ✓ {obj_type.capitalize()} {schema}.{name}: {count:,} rows", log_file)
 
                 return True
         else:
             # Similar logic for psycopg3
             with conn.cursor() as cur:
+                # Check for tables (nodes, fotrute)
                 cur.execute("""
                     SELECT table_name
                     FROM information_schema.tables
                     WHERE table_schema = %s
-                      AND table_name IN ('nodes', 'fotrute', 'anchor_nodes')
+                      AND table_name IN ('nodes', 'fotrute')
                 """, (schema,))
-                tables = [row[0] for row in cur.fetchall()]
+                tables = {row[0] for row in cur.fetchall()}
 
-                if len(tables) < 3:
-                    missing = set(['nodes', 'fotrute', 'anchor_nodes']) - set(tables)
-                    log(f"✗ Missing required tables: {', '.join(missing)}", log_file)
+                # Check for materialized views (anchor_nodes)
+                cur.execute("""
+                    SELECT matviewname
+                    FROM pg_matviews
+                    WHERE schemaname = %s
+                      AND matviewname = 'anchor_nodes'
+                """, (schema,))
+                matviews = {row[0] for row in cur.fetchall()}
+
+                # Combine found objects
+                found_objects = tables | matviews
+                required = {'nodes', 'fotrute', 'anchor_nodes'}
+                missing = required - found_objects
+
+                if missing:
+                    missing_list = []
+                    for name in missing:
+                        if name == 'anchor_nodes':
+                            missing_list.append(f"{name} (materialized view)")
+                        else:
+                            missing_list.append(f"{name} (table)")
+                    log(f"✗ Missing required objects: {', '.join(missing_list)}", log_file)
+                    if 'anchor_nodes' in missing:
+                        log(f"  Run 'make run-migrations' to create anchor_nodes materialized view", log_file)
                     return False
 
-                for table in ['nodes', 'fotrute', 'anchor_nodes']:
+                for name in ['nodes', 'fotrute', 'anchor_nodes']:
                     # Use parameterized query with identifier quoting for safety
                     from psycopg import sql
                     query = sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
                         sql.Identifier(schema),
-                        sql.Identifier(table)
+                        sql.Identifier(name)
                     )
                     cur.execute(query)
                     count = cur.fetchone()[0]
                     if count == 0:
-                        log(f"✗ Table {schema}.{table} is empty", log_file)
+                        obj_type = 'materialized view' if name == 'anchor_nodes' else 'table'
+                        log(f"✗ {obj_type.capitalize()} {schema}.{name} is empty", log_file)
                         return False
-                    log(f"  ✓ Table {schema}.{table}: {count:,} rows", log_file)
+                    obj_type = 'materialized view' if name == 'anchor_nodes' else 'table'
+                    log(f"  ✓ {obj_type.capitalize()} {schema}.{name}: {count:,} rows", log_file)
 
                 return True
     except Exception as e:
@@ -578,45 +629,65 @@ def validate_prerequisites(conn, schema: str, log_file: Optional[Path] = None) -
         return False
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Build links from segments and anchor nodes')
-    parser.add_argument('--schema', type=str, help='Schema name (default: auto-detect turrutebasen)')
-    parser.add_argument('--log-dir', type=Path, default=Path('./logs'),
-                       help='Directory for log files (default: ./logs)')
-    parser.add_argument('--skip-validation', action='store_true',
-                       help='Skip prerequisite validation (not recommended)')
-    args = parser.parse_args()
+def build_links_main(args=None, log_file=None) -> int:
+    """Main entry point that can be called programmatically.
+
+    Args:
+        args: Optional argparse.Namespace with arguments. If None, will parse from command line.
+        log_file: Optional log file path. If None, will be created from args.log_dir.
+
+    Returns:
+        Exit code: 0 for success, non-zero for failure
+    """
+    # Parse arguments if not provided
+    if args is None:
+        parser = argparse.ArgumentParser(description='Build links from segments and anchor nodes')
+        parser.add_argument('--schema', type=str, help='Schema name (default: auto-detect turrutebasen)')
+        parser.add_argument('--log-dir', type=Path, default=Path('./logs'),
+                           help='Directory for log files (default: ./logs)')
+        parser.add_argument('--skip-validation', action='store_true',
+                           help='Skip prerequisite validation (not recommended)')
+        parser.add_argument('--quiet', action='store_true',
+                           help='Quiet mode: suppress QA report output (useful when called from migrations)')
+        args = parser.parse_args()
 
     # Setup logging
-    log_file = setup_logging(args.log_dir)
+    if log_file is None:
+        log_file = setup_logging(args.log_dir if hasattr(args, 'log_dir') else Path('./logs'))
+
+    quiet = getattr(args, 'quiet', False)
+
     log("=== Starting build-links ===", log_file)
-    log(f"Log file: {log_file}", log_file)
+    if not quiet:
+        log(f"Log file: {log_file}", log_file)
 
     # Connect to database
+    conn = None
     try:
         conn = get_db_connection()
     except Exception as e:
         log(f"✗ Failed to connect to database: {e}", log_file)
-        sys.exit(1)
+        return 1
 
     try:
         # Find or use schema
-        if args.schema:
+        if hasattr(args, 'schema') and args.schema:
             schema = args.schema
         else:
             schema = find_schema(conn)
             if not schema:
                 log("✗ Could not find turrutebasen schema. Use --schema to specify.", log_file)
-                sys.exit(1)
+                return 1
 
         log(f"Using schema: {schema}", log_file)
 
         # Validate prerequisites
-        if not args.skip_validation:
+        skip_validation = getattr(args, 'skip_validation', False)
+        if not skip_validation:
             log("==> Validating prerequisites...", log_file)
             if not validate_prerequisites(conn, schema, log_file):
                 log("✗ Prerequisites validation failed - aborting", log_file)
-                sys.exit(1)
+                return 1
             log("  ✓ Prerequisites validated", log_file)
 
         # Create tables
@@ -626,7 +697,7 @@ def main():
             log("  ✓ Tables created", log_file)
         except Exception as e:
             log(f"✗ Failed to create tables: {e}", log_file)
-            sys.exit(1)
+            return 1
 
         # Load data
         log("==> Loading data...", log_file)
@@ -639,10 +710,10 @@ def main():
 
             if not segments_dict:
                 log("⚠ Warning: No segments found", log_file)
-                sys.exit(0)  # Not an error, just nothing to do
+                return 0  # Not an error, just nothing to do
         except Exception as e:
             log(f"✗ Failed to load data: {e}", log_file)
-            sys.exit(1)
+            return 1
 
         # Build links
         log("==> Building links...", log_file)
@@ -653,7 +724,7 @@ def main():
                 log(f"  ⚠ Found {len(errors)} errors (dangling/branch/loop)", log_file)
         except Exception as e:
             log(f"✗ Failed to build links: {e}", log_file)
-            sys.exit(1)
+            return 1
 
         # Insert into database
         log("==> Inserting links into database...", log_file)
@@ -662,7 +733,7 @@ def main():
             log("  ✓ Links inserted", log_file)
         except Exception as e:
             log(f"✗ Failed to insert links: {e}", log_file)
-            sys.exit(1)
+            return 1
 
         # Update geometries
         log("==> Updating link geometries...", log_file)
@@ -671,14 +742,18 @@ def main():
             log("  ✓ Link geometries updated", log_file)
         except Exception as e:
             log(f"✗ Failed to update geometries: {e}", log_file)
-            sys.exit(1)
+            return 1
 
-        # Print QA report
+        # Print QA report (unless quiet mode)
         used_segment_ids = {ls['segment_id'] for ls in link_segments}
-        log("==> QA Report", log_file)
-        print_qa_report(links, len(segments_dict), used_segment_ids, errors)
+        if not quiet:
+            log("==> QA Report", log_file)
+            print_qa_report(links, len(segments_dict), used_segment_ids, errors)
+        else:
+            # In quiet mode, just log summary to file
+            log(f"QA Summary: {len(links)} links, {len(used_segment_ids)}/{len(segments_dict)} segments used, {len(errors)} errors", log_file)
 
-        # Also log QA report to file
+        # Always log QA report to file
         with open(log_file, 'a') as f:
             f.write("\n" + "="*60 + "\n")
             f.write("QA REPORT\n")
@@ -691,17 +766,25 @@ def main():
             f.write("="*60 + "\n")
 
         log("=== Build-links completed successfully ===", log_file)
+        return 0
 
     except KeyboardInterrupt:
         log("⚠ Interrupted by user", log_file)
-        sys.exit(130)
+        return 130
     except Exception as e:
         log(f"✗ Unexpected error: {e}", log_file)
         import traceback
         log(traceback.format_exc(), log_file, also_print=False)
-        sys.exit(1)
+        return 1
     finally:
-        conn.close()
+        if conn:
+            conn.close()
+
+
+def main():
+    """CLI entry point."""
+    exit_code = build_links_main()
+    sys.exit(exit_code)
 
 
 if __name__ == '__main__':

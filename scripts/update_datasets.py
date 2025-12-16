@@ -111,10 +111,10 @@ def check_table_exists_and_modified(conn, table_name: str) -> Tuple[bool, Option
             # This tracks vacuum/analyze times which are good proxies for when data was loaded
             cur.execute("""
                 SELECT GREATEST(
-                    COALESCE(stat_last_vacuum, '1970-01-01'::timestamp),
-                    COALESCE(stat_last_autovacuum, '1970-01-01'::timestamp),
-                    COALESCE(stat_last_analyze, '1970-01-01'::timestamp),
-                    COALESCE(stat_last_autoanalyze, '1970-01-01'::timestamp)
+                    COALESCE(last_vacuum, '1970-01-01'::timestamp),
+                    COALESCE(last_autovacuum, '1970-01-01'::timestamp),
+                    COALESCE(last_analyze, '1970-01-01'::timestamp),
+                    COALESCE(last_autoanalyze, '1970-01-01'::timestamp)
                 )
                 FROM pg_stat_user_tables
                 WHERE schemaname = %s AND relname = %s
@@ -341,10 +341,10 @@ def check_import_needed(
                 cur.execute("""
                     SELECT relname,
                            GREATEST(
-                               COALESCE(stat_last_vacuum, '1970-01-01'::timestamp),
-                               COALESCE(stat_last_autovacuum, '1970-01-01'::timestamp),
-                               COALESCE(stat_last_analyze, '1970-01-01'::timestamp),
-                               COALESCE(stat_last_autoanalyze, '1970-01-01'::timestamp)
+                               COALESCE(last_vacuum, '1970-01-01'::timestamp),
+                               COALESCE(last_autovacuum, '1970-01-01'::timestamp),
+                               COALESCE(last_analyze, '1970-01-01'::timestamp),
+                               COALESCE(last_autoanalyze, '1970-01-01'::timestamp)
                            ) as mod_time
                     FROM pg_stat_user_tables
                     WHERE schemaname = 'public'
