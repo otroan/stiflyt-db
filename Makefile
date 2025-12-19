@@ -11,7 +11,7 @@ VENV := venv
 PYTHON := $(VENV)/bin/python3
 PIP := $(VENV)/bin/pip
 
-.PHONY: dependencies download-matrikkel create-db ensure-db drop-db load-matrikkel setup-matrikkel reload-matrikkel inspect-matrikkel inspect-wsdl run-api test update-datasets db-status inspect-db run-migrations verify-migration build-links cron-update
+.PHONY: dependencies download-matrikkel create-db ensure-db drop-db load-matrikkel setup-matrikkel reload-matrikkel inspect-matrikkel inspect-wsdl run-api test update-datasets db-status inspect-db run-migrations verify-migration build-links cron-update setup-roles fresh-start
 
 # Install all required system dependencies (Ubuntu/Debian)
 dependencies:
@@ -111,6 +111,74 @@ create-db:
 
 # Ensure database exists (safe to run multiple times)
 ensure-db: create-db
+
+# Fresh start: Drop and recreate database with proper setup
+fresh-start:
+	@echo "==> FRESH START: Sletter og gjenoppretter database..."
+	@echo "  ⚠ Dette vil slette all eksisterende data!"
+	@read -p "  Er du sikker? (skriv 'yes' for å bekrefte): " confirm && [ "$$confirm" = "yes" ] || exit 1
+	@echo ""
+	@echo "==> Steg 1: Sletter eksisterende database..."
+	@sudo -u postgres psql -c "DROP DATABASE IF EXISTS $(PGDATABASE);" 2>&1 && echo "  ✓ Database slettet" || echo "  ⊙ Database eksisterte ikke"
+	@echo ""
+	@echo "==> Steg 2: Oppretter ny database..."
+	@sudo -u postgres psql -c "CREATE DATABASE $(PGDATABASE);" 2>&1 && echo "  ✓ Database opprettet" || (echo "  ✗ Kunne ikke opprette database"; exit 1)
+	@sudo -u postgres psql -d $(PGDATABASE) -c "CREATE EXTENSION IF NOT EXISTS postgis;" 2>&1 > /dev/null && echo "  ✓ PostGIS extension aktivert" || (echo "  ✗ Kunne ikke aktivere PostGIS"; exit 1)
+	@echo ""
+	@echo "==> Steg 3: Setter opp roller og privilegier..."
+	@sudo -u postgres psql -d $(PGDATABASE) -f migrations/000_setup_roles.sql 2>&1 | grep -v "^WARNING:" | grep -v "^NOTICE:" || true
+	@echo "  ✓ Roller konfigurert"
+	@echo ""
+	@echo "==> Steg 4: Laster inn data (dette kan ta lang tid)..."
+	@echo "  ⚠ Kjør dette manuelt: PGUSER=stiflyt_updater make update-datasets"
+	@echo ""
+	@echo "==> Steg 5: Kjør migrasjoner..."
+	@echo "  ⚠ Kjør dette manuelt: PGUSER=stiflyt_updater make run-migrations"
+	@echo ""
+	@echo "==> Fresh start fullført!"
+	@echo "  Neste steg:"
+	@echo "    1. PGUSER=stiflyt_updater make update-datasets"
+	@echo "    2. PGUSER=stiflyt_updater make run-migrations"
+
+# Setup database roles and permissions (run once after create-db)
+# Requires superuser privileges - automatically tries as postgres if current user fails
+setup-roles:
+	@echo "==> Setting up database roles and permissions..."
+	@if [ "$(PGHOST)" = "localhost" ]; then \
+		PSQL_HOST="" PSQL_PORT=""; \
+		if command -v sudo > /dev/null 2>&1; then \
+			echo "  ℹ Kjører som postgres superuser (kreves for å opprette roller)..."; \
+			sudo -u postgres psql -d $(PGDATABASE) -f migrations/000_setup_roles.sql 2>&1 | grep -v "^ERROR:" || true; \
+			if sudo -u postgres psql -d $(PGDATABASE) -t -c "SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_updater'" 2>/dev/null | grep -q 1; then \
+				echo "  ✓ Roles configured"; \
+			else \
+				echo "  ✗ Kunne ikke opprette roller."; \
+				echo "     Kjør manuelt:"; \
+				echo "     sudo -u postgres psql -d $(PGDATABASE) -f migrations/000_setup_roles.sql"; \
+				exit 1; \
+			fi; \
+		else \
+			echo "  ✗ sudo ikke tilgjengelig. Kjør manuelt:"; \
+			echo "     sudo -u postgres psql -d $(PGDATABASE) -f migrations/000_setup_roles.sql"; \
+			exit 1; \
+		fi; \
+	else \
+		PSQL_HOST="-h $(PGHOST)"; PSQL_PORT="-p $(PGPORT)"; \
+		if [ -z "$(PGPASSWORD)" ]; then \
+			echo "  ⚠ PGPASSWORD må settes for remote connections"; \
+			exit 1; \
+		fi; \
+		echo "  ℹ Kjører som postgres superuser..."; \
+		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U postgres -d $(PGDATABASE) \
+			-f migrations/000_setup_roles.sql 2>&1 | grep -v "^ERROR:" || true; \
+		if PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U postgres -d $(PGDATABASE) \
+			-t -c "SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_updater'" 2>/dev/null | grep -q 1; then \
+			echo "  ✓ Roles configured"; \
+		else \
+			echo "  ✗ Kunne ikke opprette roller."; \
+			exit 1; \
+		fi; \
+	fi
 
 drop-db:
 	@echo "==> Sletter database '$(PGDATABASE)' ..."

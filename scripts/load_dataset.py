@@ -325,7 +325,14 @@ def sanitize_identifier(name: str) -> str:
 
 
 def ensure_schema_exists(db_params: dict, schema: str) -> bool:
-    """Create schema if not exists."""
+    """Create schema if not exists and grant privileges to roles.
+
+    After creating a schema, this function also grants privileges to:
+    - stiflyt_updater: Full write access
+    - stiflyt_reader: Read-only access
+
+    Uses the grant_schema_privileges() function if it exists (created by migration 000_setup_roles.sql).
+    """
     env = os.environ.copy()
     if db_params.get('password'):
         env['PGPASSWORD'] = db_params['password']
@@ -337,10 +344,26 @@ def ensure_schema_exists(db_params: dict, schema: str) -> bool:
         cmd.extend(['-p', str(db_params['port'])])
     cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q'])
 
-    sql = f"CREATE SCHEMA IF NOT EXISTS {schema};"
+    # Create schema and grant privileges
+    # Use the helper function if it exists (from migration 000_setup_roles.sql)
+    sql = f"""
+    CREATE SCHEMA IF NOT EXISTS {schema};
+
+    -- Grant privileges using helper function if it exists
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM pg_proc p
+            JOIN pg_namespace n ON p.pronamespace = n.oid
+            WHERE n.nspname = 'public' AND p.proname = 'grant_schema_privileges'
+        ) THEN
+            PERFORM grant_schema_privileges('{schema}');
+        END IF;
+    END $$;
+    """
 
     try:
-        subprocess.run(
+        result = subprocess.run(
             cmd,
             input=sql,
             env=env,

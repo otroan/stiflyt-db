@@ -60,16 +60,33 @@ BEGIN
     RAISE NOTICE '';
     RAISE NOTICE 'Step 1: Creating nodes table...';
     -- Preserve SRID from segments table
-    EXECUTE format('
-        DROP TABLE IF EXISTS %I.%I CASCADE;
+    -- Use IF EXISTS to make it idempotent, and handle case where table exists but we're not owner
+    BEGIN
+        EXECUTE format('DROP TABLE IF EXISTS %I.%I CASCADE', schema_name, nodes_table);
+    EXCEPTION WHEN insufficient_privilege THEN
+        -- If we can't drop (not owner), try to alter owner first, then drop
+        BEGIN
+            EXECUTE format('ALTER TABLE %I.%I OWNER TO stiflyt_updater', schema_name, nodes_table);
+            EXECUTE format('DROP TABLE IF EXISTS %I.%I CASCADE', schema_name, nodes_table);
+        EXCEPTION WHEN OTHERS THEN
+            -- If that fails too, just continue - CREATE TABLE IF NOT EXISTS will handle it
+            RAISE NOTICE 'Could not drop existing table (not owner), will use CREATE TABLE IF NOT EXISTS';
+        END;
+    END;
 
-        CREATE TABLE %I.%I (
-            id SERIAL PRIMARY KEY,
-            geom GEOMETRY(POINT) NOT NULL,
-            -- Deterministic hash for exact geometry matching
-            geom_hash BYTEA NOT NULL UNIQUE
-        );
-    ', schema_name, nodes_table, schema_name, nodes_table);
+    -- Create table (idempotent - will fail silently if exists and we're not owner, but that's OK)
+    BEGIN
+        EXECUTE format('
+            CREATE TABLE %I.%I (
+                id SERIAL PRIMARY KEY,
+                geom GEOMETRY(POINT) NOT NULL,
+                -- Deterministic hash for exact geometry matching
+                geom_hash BYTEA NOT NULL UNIQUE
+            );
+        ', schema_name, nodes_table);
+    EXCEPTION WHEN duplicate_table THEN
+        RAISE NOTICE 'Table %.% already exists, skipping creation', schema_name, nodes_table;
+    END;
 
     RAISE NOTICE '  ✓ Created table: %.%', schema_name, nodes_table;
     RAISE NOTICE '  Time: %', clock_timestamp() - step_time;

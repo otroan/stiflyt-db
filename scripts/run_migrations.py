@@ -105,6 +105,87 @@ def check_links_table_exists(db_params: dict) -> bool:
         return False
 
 
+def check_teig_omrade_spatial_index(db_params: dict) -> bool:
+    """Check if spatial GIST index exists on teig.omrade (KRITISK).
+
+    This function checks if:
+    1. The teig table exists in any of these schemas:
+       - 'public' schema
+       - Schema with prefix 'teig' or 'teig_*'
+       - Schema with prefix 'matrikkel*' or 'matrikkeleneiendomskartteig_*'
+    2. The omrade column exists as a geometry column
+    3. A GIST spatial index exists on teig.omrade
+
+    Args:
+        db_params: Database connection parameters
+
+    Returns:
+        True if spatial index exists, False otherwise
+    """
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    cmd = ['psql']
+    if db_params.get('host'):
+        cmd.extend(['-h', db_params['host']])
+    if db_params.get('port'):
+        cmd.extend(['-p', str(db_params['port'])])
+    cmd.extend([
+        '-U', db_params['user'],
+        '-d', db_params['database'],
+        '-t',  # Tuples only (no headers)
+        '-A',  # Unaligned output
+        '-c', """
+            SELECT EXISTS (
+                SELECT 1
+                FROM public.geometry_columns gc
+                JOIN pg_indexes pi ON pi.schemaname = gc.f_table_schema
+                                  AND pi.tablename = gc.f_table_name
+                JOIN pg_class pc ON pc.relname = pi.indexname
+                JOIN pg_am am ON am.oid = pc.relam
+                WHERE (
+                    gc.f_table_schema = 'public'
+                    OR gc.f_table_schema = 'teig'
+                    OR gc.f_table_schema LIKE 'teig_%'
+                    OR gc.f_table_schema LIKE 'matrikkel%'
+                    OR gc.f_table_schema LIKE 'matrikkeleneiendomskartteig_%'
+                )
+                  AND gc.f_table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
+                  AND gc.f_table_name = 'teig'
+                  AND gc.f_geometry_column = 'omrade'
+                  AND am.amname = 'gist'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM pg_index pidx
+                      JOIN pg_attribute pattr ON pattr.attrelid = pidx.indrelid
+                      JOIN pg_class ptab ON ptab.oid = pidx.indrelid
+                      JOIN pg_namespace pns ON pns.oid = ptab.relnamespace
+                      WHERE pidx.indexrelid = pc.oid
+                        AND pattr.attnum = ANY(pidx.indkey)
+                        AND pattr.attname = 'omrade'
+                        AND pns.nspname = gc.f_table_schema
+                        AND ptab.relname = 'teig'
+                  )
+            );
+        """
+    ])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        # Result should be 't' (true) or 'f' (false)
+        return result.stdout.strip() == 't'
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # If we can't check, assume it doesn't exist (safer to warn)
+        return False
+
+
 def should_run_build_links(migration_003: Optional[Path], db_params: dict) -> bool:
     """Determine if build-links should run before migration 003.
 
@@ -309,7 +390,19 @@ def main():
     elif migration_003:
         print(f"  ⊙ build-links ikke nødvendig (links-tabellen eksisterer allerede)")
 
+    # KRITISK: Check if spatial index exists on teig.omrade
+    # Note: PostGIS typically creates this index automatically, but we verify it exists
+    if not check_teig_omrade_spatial_index(db_params):
+        print(f"  ⚠ KRITISK: Spatial index mangler på teig.omrade!", file=sys.stderr)
+        print(f"     Dette kan forårsake alvorlige ytelsesproblemer.", file=sys.stderr)
+        print(f"     PostGIS bør opprette indeksen automatisk, men hvis ikke:", file=sys.stderr)
+        print(f"     CREATE INDEX teig_omrade_gix ON <schema>.teig USING GIST (omrade);", file=sys.stderr)
+    else:
+        print(f"  ✓ Spatial index eksisterer på teig.omrade (PostGIS oppretter automatisk)")
+
     # Run migrations in order
+    # All migrations are idempotent, so we run them all every time
+    # Stop on first failure
     success_count = 0
     failed_count = 0
     failed_migrations = []
@@ -323,14 +416,18 @@ def main():
             print(f"     ✗ {migration_file.name} feilet")
             failed_count += 1
             failed_migrations.append(migration_file.name)
-            # Continue with other migrations even if one fails
-            # (you can change this behavior if needed)
+            # Stop on first failure
+            print(f"", file=sys.stderr)
+            print(f"✗ Migrasjon feilet - stopper videre kjøring", file=sys.stderr)
+            print(f"  Feilet på: {migration_file.name}", file=sys.stderr)
+            break
 
     # Summary
     print(f"==> Migrasjoner fullført")
-    print(f"  ✓ Vellykket: {success_count}")
-    print(f"  ✗ Feilet: {failed_count}")
-    if failed_migrations:
+    if success_count > 0:
+        print(f"  ✓ Vellykket: {success_count}")
+    if failed_count > 0:
+        print(f"  ✗ Feilet: {failed_count}")
         print(f"  Feilede migrasjoner: {', '.join(failed_migrations)}")
 
     if failed_count > 0:

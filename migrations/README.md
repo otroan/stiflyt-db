@@ -11,6 +11,44 @@ This directory contains SQL migration files that are executed after data import 
 
 ## Migration Files
 
+### `000_setup_roles.sql`
+
+Sets up database roles and permissions for secure access:
+
+- **`stiflyt_updater`** - Full write access role for cron updates (`update-datasets`, migrations)
+- **`stiflyt_reader`** - Read-only access role for backend application
+
+**Important**: This migration should be run **once** after creating the database, before loading any data. It grants:
+- Write access to `stiflyt_updater` for all schemas (CREATE, DROP, INSERT, UPDATE, DELETE, CREATE INDEX, etc.)
+- Read-only access to `stiflyt_reader` for all schemas (SELECT only)
+- Default privileges for future objects
+- Helper function `grant_schema_privileges()` for granting privileges on new schemas
+
+**Usage**:
+```bash
+# Run as superuser (postgres)
+sudo -u postgres psql -d matrikkel -f migrations/000_setup_roles.sql
+
+# Or use the Makefile target
+make setup-roles
+```
+
+**After running**, set passwords:
+```sql
+ALTER ROLE stiflyt_updater WITH PASSWORD 'your_secure_password';
+ALTER ROLE stiflyt_reader WITH PASSWORD 'your_secure_password';
+```
+
+**For cron updates**, use `stiflyt_updater`:
+```bash
+PGUSER=stiflyt_updater PGPASSWORD=... make update-datasets
+```
+
+**For backend**, use `stiflyt_reader`:
+```bash
+PGUSER=stiflyt_reader PGPASSWORD=... (in your backend config)
+```
+
 ### `001_add_fotrute_indexes.sql`
 
 Creates critical indexes for the turrutebasen dataset:
@@ -23,6 +61,47 @@ Creates critical indexes for the turrutebasen dataset:
 - **ANALYZE** commands for `fotrute` and `fotruteinfo` tables to update query planner statistics
 
 **Note**: This migration dynamically finds the schema with prefix `turogfriluftsruter_*` since the schema hash changes with each dataset update.
+
+### `002_build_topology.sql`
+
+Creates topology tables and indexes for route network analysis (see migration file for details).
+
+### `003_add_link_ruteinfo_view.sql`
+
+Creates materialized view linking routes with route info (see migration file for details).
+
+### `004_add_link_endpoint_names.sql`
+
+Adds names to anchor nodes from ruteinfopunkt and stedsnavn (see migration file for details).
+
+### `005_create_stable_views.sql`
+
+Creates stable views in a fixed `stiflyt` schema that point to the current dynamic schema.
+
+**Purpose**: Kartverket creates schemas with changing hash suffixes (e.g., `turogfriluftsruter_abc123`). This migration creates views in a fixed `stiflyt` schema so the backend can use stable names like `stiflyt.fotrute` instead of `turogfriluftsruter_abc123.fotrute`.
+
+**What it does**:
+- Creates `stiflyt` schema if it doesn't exist
+- Creates views in `stiflyt` schema pointing to current dynamic schema:
+  - `stiflyt.fotrute` → `turogfriluftsruter_*.*.fotrute`
+  - `stiflyt.fotruteinfo` → `turogfriluftsruter_*.*.fotruteinfo`
+  - `stiflyt.links` → `turogfriluftsruter_*.*.links`
+  - `stiflyt.nodes` → `turogfriluftsruter_*.*.nodes`
+  - `stiflyt.anchor_nodes` → `turogfriluftsruter_*.*.anchor_nodes`
+  - `stiflyt.link_ruteinfo` → `turogfriluftsruter_*.*.link_ruteinfo`
+  - `stiflyt.links_with_routes` → `turogfriluftsruter_*.*.links_with_routes`
+- Automatically updates views after each dataset update (idempotent)
+
+**Backend usage**:
+```sql
+-- Instead of this (schema name changes with each update):
+SELECT * FROM turogfriluftsruter_abc123.fotrute;
+
+-- Use this (stable schema name):
+SELECT * FROM stiflyt.fotrute;
+```
+
+**Note**: PostGIS automatically creates GIST indexes on geometry columns (including `teig.omrade`), so no separate migration is needed for teig spatial indexes.
 
 ## Creating New Migrations
 

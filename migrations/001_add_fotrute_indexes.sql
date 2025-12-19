@@ -36,12 +36,27 @@ BEGIN
           AND table_name = 'fotrute'
     ) THEN
         -- Drop index if it already exists (for idempotency)
-        EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotrute_senterlinje_gist');
+        -- Handle case where we're not owner of the index
+        BEGIN
+            EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotrute_senterlinje_gist');
+        EXCEPTION WHEN insufficient_privilege THEN
+            -- Not owner - try to alter owner first, then drop
+            BEGIN
+                EXECUTE format('ALTER INDEX %I.%I OWNER TO stiflyt_updater', schema_name, 'idx_fotrute_senterlinje_gist');
+                EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotrute_senterlinje_gist');
+            EXCEPTION WHEN OTHERS THEN
+                -- If that fails too, just continue - CREATE INDEX will handle it
+                RAISE NOTICE 'Could not drop existing index (not owner), will create new one';
+            END;
+        END;
 
-        -- Create GIST index on senterlinje geometry column
-        EXECUTE format('CREATE INDEX idx_fotrute_senterlinje_gist ON %I.fotrute USING GIST (senterlinje)', schema_name);
-
-        RAISE NOTICE 'Created GIST index: %.idx_fotrute_senterlinje_gist', schema_name;
+        -- Create GIST index on senterlinje geometry column (idempotent - will fail if exists, but that's OK)
+        BEGIN
+            EXECUTE format('CREATE INDEX idx_fotrute_senterlinje_gist ON %I.fotrute USING GIST (senterlinje)', schema_name);
+            RAISE NOTICE 'Created GIST index: %.idx_fotrute_senterlinje_gist', schema_name;
+        EXCEPTION WHEN duplicate_table THEN
+            RAISE NOTICE 'Index idx_fotrute_senterlinje_gist already exists, skipping creation';
+        END;
     ELSE
         RAISE WARNING 'Table %.fotrute does not exist. Skipping GIST index creation.', schema_name;
     END IF;
@@ -54,18 +69,58 @@ BEGIN
           AND table_name = 'fotruteinfo'
     ) THEN
         -- Index on fotrute_fk for faster JOINs
-        EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_fotrute_fk');
-        EXECUTE format('CREATE INDEX idx_fotruteinfo_fotrute_fk ON %I.fotruteinfo USING BTREE (fotrute_fk)', schema_name);
-        RAISE NOTICE 'Created BTREE index: %.idx_fotruteinfo_fotrute_fk', schema_name;
+        BEGIN
+            EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_fotrute_fk');
+        EXCEPTION WHEN insufficient_privilege THEN
+            BEGIN
+                EXECUTE format('ALTER INDEX %I.%I OWNER TO stiflyt_updater', schema_name, 'idx_fotruteinfo_fotrute_fk');
+                EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_fotrute_fk');
+            EXCEPTION WHEN OTHERS THEN
+                RAISE NOTICE 'Could not drop index idx_fotruteinfo_fotrute_fk (not owner)';
+            END;
+        END;
+        BEGIN
+            EXECUTE format('CREATE INDEX idx_fotruteinfo_fotrute_fk ON %I.fotruteinfo USING BTREE (fotrute_fk)', schema_name);
+            RAISE NOTICE 'Created BTREE index: %.idx_fotruteinfo_fotrute_fk', schema_name;
+        EXCEPTION WHEN duplicate_table THEN
+            RAISE NOTICE 'Index idx_fotruteinfo_fotrute_fk already exists, skipping';
+        END;
 
         -- Index on rutenummer for prefix filtering
-        EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_rutenummer');
-        EXECUTE format('CREATE INDEX idx_fotruteinfo_rutenummer ON %I.fotruteinfo USING BTREE (rutenummer)', schema_name);
-        RAISE NOTICE 'Created BTREE index: %.idx_fotruteinfo_rutenummer', schema_name;
+        BEGIN
+            EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_rutenummer');
+        EXCEPTION WHEN insufficient_privilege THEN
+            BEGIN
+                EXECUTE format('ALTER INDEX %I.%I OWNER TO stiflyt_updater', schema_name, 'idx_fotruteinfo_rutenummer');
+                EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_rutenummer');
+            EXCEPTION WHEN OTHERS THEN
+                RAISE NOTICE 'Could not drop index idx_fotruteinfo_rutenummer (not owner)';
+            END;
+        END;
+        BEGIN
+            EXECUTE format('CREATE INDEX idx_fotruteinfo_rutenummer ON %I.fotruteinfo USING BTREE (rutenummer)', schema_name);
+            RAISE NOTICE 'Created BTREE index: %.idx_fotruteinfo_rutenummer', schema_name;
+        EXCEPTION WHEN duplicate_table THEN
+            RAISE NOTICE 'Index idx_fotruteinfo_rutenummer already exists, skipping';
+        END;
 
         -- Index on vedlikeholdsansvarlig for organization filtering
-        EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_vedlikeholdsansvarlig');
-        EXECUTE format('CREATE INDEX idx_fotruteinfo_vedlikeholdsansvarlig ON %I.fotruteinfo USING BTREE (vedlikeholdsansvarlig)', schema_name);
+        BEGIN
+            EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_vedlikeholdsansvarlig');
+        EXCEPTION WHEN insufficient_privilege THEN
+            BEGIN
+                EXECUTE format('ALTER INDEX %I.%I OWNER TO stiflyt_updater', schema_name, 'idx_fotruteinfo_vedlikeholdsansvarlig');
+                EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_vedlikeholdsansvarlig');
+            EXCEPTION WHEN OTHERS THEN
+                RAISE NOTICE 'Could not drop index idx_fotruteinfo_vedlikeholdsansvarlig (not owner)';
+            END;
+        END;
+        BEGIN
+            EXECUTE format('CREATE INDEX idx_fotruteinfo_vedlikeholdsansvarlig ON %I.fotruteinfo USING BTREE (vedlikeholdsansvarlig)', schema_name);
+            RAISE NOTICE 'Created BTREE index: %.idx_fotruteinfo_vedlikeholdsansvarlig', schema_name;
+        EXCEPTION WHEN duplicate_table THEN
+            RAISE NOTICE 'Index idx_fotruteinfo_vedlikeholdsansvarlig already exists, skipping';
+        END;
         RAISE NOTICE 'Created BTREE index: %.idx_fotruteinfo_vedlikeholdsansvarlig', schema_name;
     ELSE
         RAISE WARNING 'Table %.fotruteinfo does not exist. Skipping BTREE index creation.', schema_name;
