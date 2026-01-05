@@ -268,6 +268,7 @@ $(VENV):
 	@echo "  ✓ Virtual environment klar"
 
 # Run tests
-test:
+test: $(VENV)
 	@echo "==> Running tests..."
-	@source venv/bin/activate && pip install -e ".[dev]" > /dev/null 2>&1 && pytest tests/ -v
+	@$(PIP) install -e ".[dev]" > /dev/null 2>&1
+	@$(VENV)/bin/python -m pytest tests/ -v
