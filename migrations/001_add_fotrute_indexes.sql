@@ -27,6 +27,19 @@ BEGIN
     RAISE NOTICE 'Found schema: %', schema_name;
     schema_found := TRUE;
 
+    -- Ensure privileges/ownership for this schema if helper exists
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM pg_proc p
+            JOIN pg_namespace n ON p.pronamespace = n.oid
+            WHERE n.nspname = 'public' AND p.proname = 'grant_schema_privileges'
+        ) THEN
+            PERFORM grant_schema_privileges(schema_name);
+        END IF;
+    EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
+        RAISE NOTICE 'Could not ensure privileges for schema %: %', schema_name, SQLERRM;
+    END;
+
     -- Create GIST index on fotrute.senterlinje for spatial queries
     -- This is critical for bounding box query performance
     IF EXISTS (
@@ -42,7 +55,7 @@ BEGIN
         EXCEPTION WHEN insufficient_privilege THEN
             -- Not owner - try to alter owner first, then drop
             BEGIN
-                EXECUTE format('ALTER INDEX %I.%I OWNER TO stiflyt_updater', schema_name, 'idx_fotrute_senterlinje_gist');
+                EXECUTE format('ALTER INDEX %I.%I OWNER TO stiflyt_owner', schema_name, 'idx_fotrute_senterlinje_gist');
                 EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotrute_senterlinje_gist');
             EXCEPTION WHEN OTHERS THEN
                 -- If that fails too, just continue - CREATE INDEX will handle it
@@ -73,7 +86,7 @@ BEGIN
             EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_fotrute_fk');
         EXCEPTION WHEN insufficient_privilege THEN
             BEGIN
-                EXECUTE format('ALTER INDEX %I.%I OWNER TO stiflyt_updater', schema_name, 'idx_fotruteinfo_fotrute_fk');
+                EXECUTE format('ALTER INDEX %I.%I OWNER TO stiflyt_owner', schema_name, 'idx_fotruteinfo_fotrute_fk');
                 EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_fotrute_fk');
             EXCEPTION WHEN OTHERS THEN
                 RAISE NOTICE 'Could not drop index idx_fotruteinfo_fotrute_fk (not owner)';
@@ -91,7 +104,7 @@ BEGIN
             EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_rutenummer');
         EXCEPTION WHEN insufficient_privilege THEN
             BEGIN
-                EXECUTE format('ALTER INDEX %I.%I OWNER TO stiflyt_updater', schema_name, 'idx_fotruteinfo_rutenummer');
+                EXECUTE format('ALTER INDEX %I.%I OWNER TO stiflyt_owner', schema_name, 'idx_fotruteinfo_rutenummer');
                 EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_rutenummer');
             EXCEPTION WHEN OTHERS THEN
                 RAISE NOTICE 'Could not drop index idx_fotruteinfo_rutenummer (not owner)';
@@ -109,7 +122,7 @@ BEGIN
             EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_vedlikeholdsansvarlig');
         EXCEPTION WHEN insufficient_privilege THEN
             BEGIN
-                EXECUTE format('ALTER INDEX %I.%I OWNER TO stiflyt_updater', schema_name, 'idx_fotruteinfo_vedlikeholdsansvarlig');
+                EXECUTE format('ALTER INDEX %I.%I OWNER TO stiflyt_owner', schema_name, 'idx_fotruteinfo_vedlikeholdsansvarlig');
                 EXECUTE format('DROP INDEX IF EXISTS %I.%I', schema_name, 'idx_fotruteinfo_vedlikeholdsansvarlig');
             EXCEPTION WHEN OTHERS THEN
                 RAISE NOTICE 'Could not drop index idx_fotruteinfo_vedlikeholdsansvarlig (not owner)';
@@ -128,11 +141,19 @@ BEGIN
 
     -- Update statistics with ANALYZE for query planner optimization
     IF schema_found THEN
-        EXECUTE format('ANALYZE %I.fotrute', schema_name);
-        RAISE NOTICE 'Analyzed table: %.fotrute', schema_name;
+        BEGIN
+            EXECUTE format('ANALYZE %I.fotrute', schema_name);
+            RAISE NOTICE 'Analyzed table: %.fotrute', schema_name;
+        EXCEPTION WHEN insufficient_privilege OR undefined_table THEN
+            RAISE NOTICE 'Skipping ANALYZE on %.fotrute (missing privileges or table)', schema_name;
+        END;
 
-        EXECUTE format('ANALYZE %I.fotruteinfo', schema_name);
-        RAISE NOTICE 'Analyzed table: %.fotruteinfo', schema_name;
+        BEGIN
+            EXECUTE format('ANALYZE %I.fotruteinfo', schema_name);
+            RAISE NOTICE 'Analyzed table: %.fotruteinfo', schema_name;
+        EXCEPTION WHEN insufficient_privilege OR undefined_table THEN
+            RAISE NOTICE 'Skipping ANALYZE on %.fotruteinfo (missing privileges or table)', schema_name;
+        END;
     END IF;
 
 END $$;

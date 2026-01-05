@@ -66,7 +66,7 @@ BEGIN
     EXCEPTION WHEN insufficient_privilege THEN
         -- If we can't drop (not owner), try to alter owner first, then drop
         BEGIN
-            EXECUTE format('ALTER TABLE %I.%I OWNER TO stiflyt_updater', schema_name, nodes_table);
+            EXECUTE format('ALTER TABLE %I.%I OWNER TO stiflyt_owner', schema_name, nodes_table);
             EXECUTE format('DROP TABLE IF EXISTS %I.%I CASCADE', schema_name, nodes_table);
         EXCEPTION WHEN OTHERS THEN
             -- If that fails too, just continue - CREATE TABLE IF NOT EXISTS will handle it
@@ -377,4 +377,3 @@ BEGIN
     RAISE NOTICE 'Anchor nodes include: topology nodes (degree != 2) and ruteinfopunkt matches';
 
 END $$;
-

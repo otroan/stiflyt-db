@@ -69,21 +69,24 @@ def connect_db(db_params: dict):
 
 
 def list_tables(conn) -> List[Dict]:
-    """List all tables with basic info."""
+    """List all tables and views with basic info."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             SELECT
-                schemaname,
-                tablename,
-                pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as size,
+                t.table_schema as schemaname,
+                t.table_name as tablename,
+                t.table_type,
+                pg_size_pretty(pg_total_relation_size(t.table_schema||'.'||t.table_name)) as size,
                 (SELECT reltuples::bigint
-                 FROM pg_class
-                 WHERE relname = tablename
-                 AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = schemaname)
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE c.relname = t.table_name
+                 AND n.nspname = t.table_schema
+                 AND c.relkind IN ('r', 'v')  -- 'r' = table, 'v' = view
                 ) as estimated_rows
-            FROM pg_tables
-            WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
-            ORDER BY schemaname, tablename
+            FROM information_schema.tables t
+            WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema')
+            ORDER BY t.table_schema, t.table_name
         """)
         return cur.fetchall()
 
@@ -279,16 +282,17 @@ def main():
 
     try:
         if args.tables:
-            print("==> Tables:")
+            print("==> Tables and Views:")
             tables = list_tables(conn)
             if tables:
                 for table in tables:
                     schema_table = f"{table['schemaname']}.{table['tablename']}"
+                    table_type = table.get('table_type', 'TABLE').upper()
                     rows = table['estimated_rows'] or 0
                     size = table['size'] or 'unknown'
-                    print(f"  {schema_table}: ~{rows:,} rows, {size}")
+                    print(f"  {schema_table} ({table_type}): ~{rows:,} rows, {size}")
             else:
-                print("  No tables found")
+                print("  No tables or views found")
             print()
 
         if args.schema:

@@ -333,11 +333,32 @@ def check_import_needed(
 
         elif format_type == 'FGDB':
             # For FGDB, we don't know table names in advance without extracting
-            # Check if any tables in public schema are newer than ZIP file
-            # This is a heuristic - if all tables are newer, assume import not needed
+            # Check if expected tables exist (for known datasets like stedsnavn)
+            # For stedsnavn FGDB dataset, we expect: stedsnavn, skrivemate, sted_posisjon
+
+            expected_tables = ['stedsnavn', 'skrivemate', 'sted_posisjon']
 
             with conn.cursor() as cur:
-                # Get all tables in public schema with their modification times
+                # Check if any of the expected tables exist
+                cur.execute("""
+                    SELECT tablename
+                    FROM pg_tables
+                    WHERE schemaname = 'public'
+                      AND tablename = ANY(%s)
+                """, (expected_tables,))
+
+                existing_tables = [row[0] for row in cur.fetchall()]
+
+                # If none of the expected tables exist, import is needed
+                if not existing_tables:
+                    return True, f"Expected FGDB tables {', '.join(expected_tables)} do not exist"
+
+                # If some but not all expected tables exist, import is needed
+                missing_tables = set(expected_tables) - set(existing_tables)
+                if missing_tables:
+                    return True, f"Missing FGDB tables: {', '.join(missing_tables)}"
+
+                # All expected tables exist - check modification times
                 cur.execute("""
                     SELECT relname,
                            GREATEST(
@@ -348,38 +369,29 @@ def check_import_needed(
                            ) as mod_time
                     FROM pg_stat_user_tables
                     WHERE schemaname = 'public'
-                    ORDER BY mod_time DESC
-                """)
+                      AND relname = ANY(%s)
+                    ORDER BY mod_time ASC
+                """, (expected_tables,))
 
                 results = cur.fetchall()
 
                 if not results:
-                    # No tables in public schema, need import
-                    return True, "No tables found in public schema"
+                    # Tables exist but no stats available, assume import needed to be safe
+                    return True, "Cannot determine modification times for FGDB tables"
 
-                # Check if any table is older than ZIP file
-                # If all tables are newer than ZIP, assume import not needed
-                all_newer = True
+                # Check if ZIP file is newer than oldest table
                 oldest_table_time = None
-                table_names = []
-
                 for table_name, mod_time in results:
-                    table_names.append(table_name)
                     if mod_time:
                         mod_timestamp = mod_time.timestamp()
                         if oldest_table_time is None or mod_timestamp < oldest_table_time:
                             oldest_table_time = mod_timestamp
-                        if zip_mtime > mod_timestamp:
-                            all_newer = False
-                            break
 
-                if all_newer and oldest_table_time:
-                    return False, f"All tables in public schema ({len(table_names)} tables) are newer than ZIP file ({datetime.fromtimestamp(zip_mtime)})"
-                elif oldest_table_time:
+                if oldest_table_time and zip_mtime > oldest_table_time:
                     return True, f"ZIP file ({datetime.fromtimestamp(zip_mtime)}) is newer than oldest table ({datetime.fromtimestamp(oldest_table_time)})"
-                else:
-                    # No modification times available, assume import needed
-                    return True, "Cannot determine table modification times"
+
+                # All tables exist and are up-to-date
+                return False, f"FGDB tables {', '.join(existing_tables)} are up-to-date"
 
         else:
             return True, f"Unknown format type: {format_type}"

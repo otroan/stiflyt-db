@@ -346,8 +346,23 @@ def ensure_schema_exists(db_params: dict, schema: str) -> bool:
 
     # Create schema and grant privileges
     # Use the helper function if it exists (from migration 000_setup_roles.sql)
+    # Also ensure stiflyt_owner is the owner (required for ogr2ogr)
     sql = f"""
+    DO $$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_owner') THEN
+            BEGIN
+                EXECUTE 'SET ROLE stiflyt_owner';
+            EXCEPTION WHEN insufficient_privilege THEN
+                RAISE NOTICE 'Could not SET ROLE stiflyt_owner (not member)';
+            END;
+        END IF;
+    END $$;
+
     CREATE SCHEMA IF NOT EXISTS {schema};
+
+    -- Ensure stiflyt_owner is the owner (required for ogr2ogr operations)
+    ALTER SCHEMA {schema} OWNER TO stiflyt_owner;
 
     -- Grant privileges using helper function if it exists
     DO $$
@@ -360,6 +375,8 @@ def ensure_schema_exists(db_params: dict, schema: str) -> bool:
             PERFORM grant_schema_privileges('{schema}');
         END IF;
     END $$;
+
+    RESET ROLE;
     """
 
     try:
@@ -377,8 +394,72 @@ def ensure_schema_exists(db_params: dict, schema: str) -> bool:
         return False
 
 
+def grant_privileges_for_schema_prefix(db_params: dict, schema_prefix: Optional[str]) -> bool:
+    """Grant privileges for all schemas matching a prefix.
+
+    Uses grant_schema_privileges() when available.
+    """
+    if not schema_prefix:
+        return True
+
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    cmd = ['psql']
+    if db_params.get('host'):
+        cmd.extend(['-h', db_params['host']])
+    if db_params.get('port'):
+        cmd.extend(['-p', str(db_params['port'])])
+    cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q'])
+
+    prefix_literal = schema_prefix.replace("'", "''")
+    sql = f"""
+    DO $$
+    DECLARE
+        s RECORD;
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM pg_proc p
+            JOIN pg_namespace n ON p.pronamespace = n.oid
+            WHERE n.nspname = 'public' AND p.proname = 'grant_schema_privileges'
+        ) THEN
+            FOR s IN
+                SELECT nspname
+                FROM pg_namespace
+                WHERE nspname LIKE '{prefix_literal}_%'
+                  AND nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
+                  AND nspname NOT LIKE 'pg_temp_%'
+                  AND nspname NOT LIKE 'pg_toast_temp_%'
+            LOOP
+                BEGIN
+                    PERFORM grant_schema_privileges(s.nspname);
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'Could not grant privileges for schema % (not owner)', s.nspname;
+                END;
+            END LOOP;
+        END IF;
+    END $$;
+    """
+
+    try:
+        subprocess.run(
+            cmd,
+            input=sql,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"  ⚠ Kunne ikke sette privileges for schema prefix {schema_prefix}: {e.stderr}", file=sys.stderr)
+        return False
+
+
 def move_schema_objects(db_params: dict, source_schema: str, target_schema: str = 'public') -> bool:
-    """Move tables and sequences from source_schema to target_schema, dropping conflicts."""
+    """Move tables and sequences from source_schema to target_schema, dropping conflicts.
+    Also sets ownership to stiflyt_owner after moving."""
     env = os.environ.copy()
     if db_params.get('password'):
         env['PGPASSWORD'] = db_params['password']
@@ -392,6 +473,17 @@ def move_schema_objects(db_params: dict, source_schema: str, target_schema: str 
 
     sql = f"""
 DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_owner') THEN
+        BEGIN
+            EXECUTE 'SET ROLE stiflyt_owner';
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE NOTICE 'Could not SET ROLE stiflyt_owner (not member)';
+        END;
+    END IF;
+END $$;
+
+DO $$
 DECLARE
     r record;
 BEGIN
@@ -400,6 +492,12 @@ BEGIN
     LOOP
         EXECUTE format('DROP TABLE IF EXISTS %I.%I CASCADE;', '{target_schema}', r.tablename);
         EXECUTE format('ALTER TABLE %I.%I SET SCHEMA %I;', '{source_schema}', r.tablename, '{target_schema}');
+        -- Set ownership to stiflyt_owner
+        BEGIN
+            EXECUTE format('ALTER TABLE %I.%I OWNER TO stiflyt_owner', '{target_schema}', r.tablename);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Could not set owner for table %.%: %', '{target_schema}', r.tablename, SQLERRM;
+        END;
     END LOOP;
 
     -- Move sequences
@@ -407,10 +505,18 @@ BEGIN
     LOOP
         EXECUTE format('DROP SEQUENCE IF EXISTS %I.%I CASCADE;', '{target_schema}', r.sequence_name);
         EXECUTE format('ALTER SEQUENCE %I.%I SET SCHEMA %I;', '{source_schema}', r.sequence_name, '{target_schema}');
+        -- Set ownership to stiflyt_owner
+        BEGIN
+            EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO stiflyt_owner', '{target_schema}', r.sequence_name);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'Could not set owner for sequence %.%: %', '{target_schema}', r.sequence_name, SQLERRM;
+        END;
     END LOOP;
 END$$;
 
 DROP SCHEMA IF EXISTS {source_schema} CASCADE;
+
+RESET ROLE;
 """
 
     try:
@@ -829,6 +935,39 @@ def check_ogr2ogr() -> bool:
         return False
 
 
+def get_fgdb_feature_count(gdb_dir: Path) -> Optional[int]:
+    """Get total feature count from FGDB file using ogrinfo.
+
+    Returns total number of features across all layers, or None if unable to determine.
+    """
+    try:
+        # Use ogrinfo to get layer information
+        # -al: list all layers
+        # -so: summary only (fast, no feature reading)
+        cmd = ['ogrinfo', '-al', '-so', str(gdb_dir)]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+        if result.returncode != 0:
+            return None
+
+        # Parse output to find feature counts
+        # ogrinfo output format: "Feature Count: 12345"
+        total_features = 0
+        for line in result.stdout.split('\n'):
+            if 'Feature Count:' in line:
+                try:
+                    # Extract number after "Feature Count: "
+                    count_str = line.split('Feature Count:')[1].strip()
+                    count = int(count_str)
+                    total_features += count
+                except (ValueError, IndexError):
+                    continue
+
+        return total_features if total_features > 0 else None
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        return None
+
+
 def load_gml_from_zip_stream(
     db_params: dict,
     zip_path: Path,
@@ -1042,7 +1181,7 @@ def load_gml_files(
 
 
 def load_fgdb(db_params: dict, gdb_dirs: List[Path], target_srid: Optional[int], staging_schema: Optional[str]) -> bool:
-    """Load FileGDB directories using ogr2ogr."""
+    """Load FileGDB directories using ogr2ogr with real-time progress and performance optimizations."""
     if not check_ogr2ogr():
         print("Feil: ogr2ogr ikke funnet. Installer GDAL:", file=sys.stderr)
         print("  Ubuntu/Debian: sudo apt-get install gdal-bin", file=sys.stderr)
@@ -1070,9 +1209,41 @@ def load_fgdb(db_params: dict, gdb_dirs: List[Path], target_srid: Optional[int],
         conn_parts.append(f"password={db_params['password']}")
     conn_str = "PG:" + " ".join(conn_parts)
 
+    # Clean up staging schema if it exists (from previous failed/aborted imports)
+    # Then recreate it for fresh import
+    if staging_schema:
+        print(f"  -> Rydder opp i staging schema {staging_schema} (hvis eksisterer)...")
+        drop_schema_sql = f"DROP SCHEMA IF EXISTS {staging_schema} CASCADE;"
+        try:
+            drop_cmd = ['psql']
+            if db_params.get('host'):
+                drop_cmd.extend(['-h', db_params['host']])
+            if db_params.get('port'):
+                drop_cmd.extend(['-p', str(db_params['port'])])
+            drop_cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q', '-c', drop_schema_sql])
+            subprocess.run(drop_cmd, env=env, capture_output=True, check=False)
+            print("     ✓ Staging schema ryddet")
+        except Exception as e:
+            print(f"     ⚠ Kunne ikke rydde staging schema (fortsetter): {e}")
+
+        # Create staging schema for fresh import
+        print(f"  -> Oppretter staging schema {staging_schema}...")
+        if not ensure_schema_exists(db_params, staging_schema):
+            print("     ✗ Kunne ikke opprette staging schema", file=sys.stderr)
+            return False
+        print("     ✓ Staging schema opprettet")
+
     success_count = 0
     for gdb_dir in gdb_dirs:
         print(f"  -> Laster {gdb_dir} (FileGDB) ...")
+
+        # Get total feature count from FGDB for progress calculation
+        print("     Sjekker antall features i FGDB...")
+        total_features = get_fgdb_feature_count(gdb_dir)
+        if total_features:
+            print(f"     Totalt antall features: {total_features:,}")
+        else:
+            print("     ⚠ Kunne ikke bestemme totalt antall features (fortsetter uten prosent)")
 
         cmd = [
             'ogr2ogr',
@@ -1082,8 +1253,12 @@ def load_fgdb(db_params: dict, gdb_dirs: List[Path], target_srid: Optional[int],
             '-nlt', 'PROMOTE_TO_MULTI',
             '-lco', 'GEOMETRY_NAME=geom',
             '-lco', 'FID=ogc_fid',
+            '-lco', 'SPATIAL_INDEX=NO',  # Deaktiver indekser under import for raskere import
+            '-lco', 'OVERWRITE=YES',  # Overskriv eksisterende tabeller
+            '-lco', 'UNLOGGED=YES',  # Bruk unlogged tables for raskere import (kan konverteres til logged etterpå)
             '--config', 'PG_USE_COPY', 'YES',  # hurtigere innlasting
-            '-gt', '50000',  # større batcher til COPY
+            '--config', 'OGR_SQLITE_CACHE', '512',  # Cache for SQLite/FGDB lesing
+            '-gt', '500000',  # større batcher til COPY (økt fra 200000 for bedre ytelse)
             '-progress',
             '-skipfailures',
             '-overwrite'
@@ -1095,23 +1270,252 @@ def load_fgdb(db_params: dict, gdb_dirs: List[Path], target_srid: Optional[int],
         if target_srid:
             cmd.extend(['-t_srs', f'EPSG:{target_srid}'])
 
+        process = None
         try:
-            result = subprocess.run(
+            # Use Popen for real-time progress output
+            process = subprocess.Popen(
                 cmd,
                 env=env,
-                capture_output=True,
-                text=True
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # Combine stderr with stdout
+                text=True,
+                bufsize=1,  # Line buffered
+                universal_newlines=True
             )
 
-            if result.returncode == 0:
+            # Read and print output line by line for real-time progress
+            # ogr2ogr sends progress to stderr, which we've combined with stdout
+            import threading
+            import time
+
+            last_progress_line = ""
+            error_lines = []
+            line_count = 0
+            has_output = False
+
+            # Show a heartbeat indicator if no progress messages appear
+            # Also check database for row counts as alternative progress
+            heartbeat_counter = [0]  # Use list to allow modification from inner function
+            last_row_count = [0]
+
+            def show_heartbeat():
+                """Show heartbeat while waiting for output."""
+                time.sleep(2)  # Wait 2 seconds before showing heartbeat
+                while process.poll() is None:
+                    heartbeat_counter[0] += 1
+                    dots = "." * (heartbeat_counter[0] % 4)  # Rotating dots
+
+                    # Try to get row count from database as progress indicator
+                    row_count_msg = ""
+                    if staging_schema and heartbeat_counter[0] % 5 == 0:  # Check every 5 seconds
+                        try:
+                            check_cmd = ['psql']
+                            if db_params.get('host'):
+                                check_cmd.extend(['-h', db_params['host']])
+                            if db_params.get('port'):
+                                check_cmd.extend(['-p', str(db_params['port'])])
+                            check_cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-t', '-q', '-c',
+                                f"SELECT COALESCE(SUM(n_live_tup), 0) FROM pg_stat_user_tables WHERE schemaname = '{staging_schema}';"])
+                            result = subprocess.run(check_cmd, env=env, capture_output=True, text=True, timeout=2)
+                            if result.returncode == 0 and result.stdout.strip():
+                                current_count = int(result.stdout.strip())
+                                if current_count > last_row_count[0]:
+                                    # Calculate percentage if we have total feature count
+                                    if total_features and total_features > 0:
+                                        percentage = min(100.0, (current_count / total_features) * 100.0)
+                                        row_count_msg = f" ({current_count:,}/{total_features:,} rader, {percentage:.1f}%)"
+                                    else:
+                                        row_count_msg = f" (~{current_count:,} rader importert)"
+                                    last_row_count[0] = current_count
+                        except Exception:
+                            pass  # Ignore errors in progress check
+
+                    print(f"\r     ⏳ Importerer{dots}{row_count_msg}", end='', flush=True)
+                    time.sleep(1)
+
+            heartbeat_thread = threading.Thread(target=show_heartbeat, daemon=True)
+            heartbeat_thread.start()
+
+            # Read from both stdout and stderr in real-time
+            for line in process.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+
+                line_count += 1
+                has_output = True  # We got output, disable heartbeat
+                heartbeat_counter[0] = -1  # Stop heartbeat
+
+                # Check for progress indicators (ogr2ogr format: "0...10...20...30...")
+                # or "Progress: X%" or feature counts
+                is_progress = (
+                    'Progress' in line or
+                    '%' in line or
+                    'features' in line.lower() or
+                    re.match(r'^\d+\.\.\.', line) or  # "0...10...20..."
+                    re.search(r'\d+/\d+', line) or  # "1234/5678"
+                    '...' in line or  # Progress dots
+                    'Copying' in line or  # COPY operations
+                    'Creating' in line  # Table creation
+                )
+
+                # Check for errors
+                is_error = line.startswith('ERROR') or 'ERROR' in line.upper()
+
+                if is_progress:
+                    # Print progress on same line (overwrite)
+                    # Truncate to 80 chars to avoid line wrapping
+                    display_line = line[:80] if len(line) <= 80 else line[:77] + "..."
+                    print(f"\r     {display_line}", end='', flush=True)
+                    last_progress_line = line
+                elif is_error:
+                    # Show errors immediately but don't overwrite progress
+                    if last_progress_line:
+                        print()  # New line before error
+                    print(f"     ⚠ {line[:80]}", flush=True)
+                    error_lines.append(line)
+                    last_progress_line = ""  # Reset so next progress shows on new line
+                else:
+                    # Show all output lines (ogr2ogr may not send progress with COPY)
+                    # This helps user see that something is happening
+                    if last_progress_line:
+                        print()  # New line before message
+                    # Show important messages, filter out noise
+                    # Always show first few lines and important operations
+                    should_show = (
+                        line_count <= 5 or  # Always show first 5 lines
+                        'Creating' in line or
+                        'Copying' in line or
+                        'Layer' in line or
+                        'table' in line.lower() or
+                        'feature' in line.lower()
+                    )
+                    if should_show and line.strip() and not line.startswith('Warning'):
+                        print(f"     {line[:80]}", flush=True)
+                    last_progress_line = ""
+
+            # Print final newline after progress
+            if last_progress_line:
+                print()  # New line after progress
+
+            # Show error summary if many errors
+            if len(error_lines) > 10:
+                print(f"\n     ⚠ {len(error_lines)} feilmelding(er) totalt (vist første 10 over)")
+
+            # Wait for process to complete
+            returncode = process.wait()
+
+            if returncode == 0:
                 success_count += 1
                 print(f"     ✓ Lastet")
             else:
-                print(f"     ✗ Feil: {result.stderr}", file=sys.stderr)
+                print(f"\n     ✗ Feil: Import feilet (exit code {returncode})", file=sys.stderr)
                 return False
         except FileNotFoundError:
             print("     ✗ ogr2ogr ikke funnet", file=sys.stderr)
             return False
+        except KeyboardInterrupt:
+            print("\n     ⚠ Import avbrutt av bruker", file=sys.stderr)
+            if process:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            return False
+
+    # Set ownership and convert unlogged tables to logged after import
+    if success_count > 0 and staging_schema:
+        print("  -> Setter eierskap til stiflyt_owner...")
+        try:
+            owner_cmd = ['psql']
+            if db_params.get('host'):
+                owner_cmd.extend(['-h', db_params['host']])
+            if db_params.get('port'):
+                owner_cmd.extend(['-p', str(db_params['port'])])
+            owner_cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q', '-c',
+                f"""
+                DO $$
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_owner') THEN
+                        BEGIN
+                            EXECUTE 'SET ROLE stiflyt_owner';
+                        EXCEPTION WHEN insufficient_privilege THEN
+                            RAISE NOTICE 'Could not SET ROLE stiflyt_owner (not member)';
+                        END;
+                    END IF;
+                END $$;
+
+                DO $$
+                DECLARE
+                    r record;
+                BEGIN
+                    -- Set ownership of all tables
+                    FOR r IN
+                        SELECT tablename
+                        FROM pg_tables
+                        WHERE schemaname = '{staging_schema}'
+                    LOOP
+                        BEGIN
+                            EXECUTE format('ALTER TABLE %I.%I OWNER TO stiflyt_owner', '{staging_schema}', r.tablename);
+                        EXCEPTION WHEN OTHERS THEN
+                            RAISE NOTICE 'Could not set owner for table %.%: %', '{staging_schema}', r.tablename, SQLERRM;
+                        END;
+                    END LOOP;
+
+                    -- Set ownership of all sequences
+                    FOR r IN
+                        SELECT sequence_name
+                        FROM information_schema.sequences
+                        WHERE sequence_schema = '{staging_schema}'
+                    LOOP
+                        BEGIN
+                            EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO stiflyt_owner', '{staging_schema}', r.sequence_name);
+                        EXCEPTION WHEN OTHERS THEN
+                            RAISE NOTICE 'Could not set owner for sequence %.%: %', '{staging_schema}', r.sequence_name, SQLERRM;
+                        END;
+                    END LOOP;
+                END $$;
+
+                RESET ROLE;
+                """])
+            subprocess.run(owner_cmd, env=env, capture_output=True, check=False)
+            print("     ✓ Eierskap satt")
+        except Exception as e:
+            print(f"     ⚠ Kunne ikke sette eierskap (fortsetter): {e}")
+
+        print("  -> Konverterer unlogged tables til logged...")
+        try:
+            convert_cmd = ['psql']
+            if db_params.get('host'):
+                convert_cmd.extend(['-h', db_params['host']])
+            if db_params.get('port'):
+                convert_cmd.extend(['-p', str(db_params['port'])])
+            convert_cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q', '-c',
+                f"""
+                DO $$
+                DECLARE
+                    r record;
+                BEGIN
+                    FOR r IN
+                        SELECT tablename
+                        FROM pg_tables
+                        WHERE schemaname = '{staging_schema}'
+                    LOOP
+                        EXECUTE format('ALTER TABLE %I.%I SET LOGGED', '{staging_schema}', r.tablename);
+                    END LOOP;
+                END $$;
+                """])
+            subprocess.run(convert_cmd, env=env, capture_output=True, check=False)
+            print("     ✓ Tables konvertert til logged")
+        except Exception as e:
+            print(f"     ⚠ Kunne ikke konvertere tables (fortsetter): {e}")
+
+        print("  -> Bygger spatial-indekser (dette kan ta noen minutter)...")
+        if create_missing_spatial_indexes(db_params, schemas=[staging_schema]):
+            print("     ✓ Indekser bygget")
+        else:
+            print("     ⚠ Kunne ikke bygge alle indekser (kan bygges manuelt senere)")
 
     return success_count > 0
 
@@ -1193,6 +1597,8 @@ def load_dataset(
                     print(f"==> Ferdig. {len(files_in_zip)} SQL-fil(er) lastet inn (uten ekstraksjon)")
                     # Extract schema prefix to analyze imported tables
                     table_names, schema_prefix = extract_table_names_from_zip_sql(zip_path, files_in_zip[0])
+                    if schema_prefix:
+                        grant_privileges_for_schema_prefix(db_params, schema_prefix)
                     if table_names:
                         # Analyze imported tables
                         analyze_tables(db_params, tables=table_names)
@@ -1267,6 +1673,8 @@ def load_dataset(
                 print(f"==> Ferdig. {len(files)} SQL-fil(er) lastet inn")
                 # Extract table names from first SQL file
                 table_names, schema_prefix = extract_table_names_from_sql(files[0])
+                if schema_prefix:
+                    grant_privileges_for_schema_prefix(db_params, schema_prefix)
                 if table_names:
                     # Analyze imported tables
                     analyze_tables(db_params, tables=table_names)
@@ -1351,4 +1759,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

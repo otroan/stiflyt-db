@@ -33,6 +33,19 @@ BEGIN
 
     RAISE NOTICE 'Adding names to anchor nodes in schema: %', schema_name;
 
+    -- Ensure privileges/ownership for this schema if helper exists
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM pg_proc p
+            JOIN pg_namespace n ON p.pronamespace = n.oid
+            WHERE n.nspname = 'public' AND p.proname = 'grant_schema_privileges'
+        ) THEN
+            PERFORM grant_schema_privileges(schema_name);
+        END IF;
+    EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
+        RAISE NOTICE 'Could not ensure privileges for schema %: %', schema_name, SQLERRM;
+    END;
+
     -- Check if stedsnavn table exists
     -- Stedsnavn has a normalized structure:
     -- - stedsnavn table: metadata (objid, sted_fk, navnestatus, etc.)
@@ -250,4 +263,3 @@ BEGIN
     RAISE NOTICE 'Anchor node names migration complete';
 
 END $$;
-

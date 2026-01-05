@@ -308,11 +308,28 @@ def run_migration(db_params: dict, migration_file: Path) -> bool:
     cmd.extend([
         '-U', db_params['user'],
         '-d', db_params['database'],
-        '-f', str(migration_file),
         '-v', 'ON_ERROR_STOP=1',  # Stop on first error
         '-v', 'client_min_messages=notice',  # Show NOTICE and WARNING messages
         '-a'  # Echo all commands (show what's being executed)
     ])
+    if migration_file.name != '000_setup_roles.sql':
+        cmd.extend([
+            '-c', """
+                DO $$
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_owner') THEN
+                        BEGIN
+                            EXECUTE 'SET ROLE stiflyt_owner';
+                        EXCEPTION WHEN insufficient_privilege THEN
+                            RAISE NOTICE 'Could not SET ROLE stiflyt_owner (not member)';
+                        END;
+                    END IF;
+                END $$;
+            """
+        ])
+    cmd.extend(['-f', str(migration_file)])
+    if migration_file.name != '000_setup_roles.sql':
+        cmd.extend(['-c', "RESET ROLE;"])
 
     try:
         result = subprocess.run(
@@ -334,6 +351,51 @@ def run_migration(db_params: dict, migration_file: Path) -> bool:
                     print(line, file=sys.stderr)
         return True
     except subprocess.CalledProcessError as e:
+        # For 000_setup_roles.sql, try running as postgres superuser if permission errors occur
+        if migration_file.name == '000_setup_roles.sql' and db_params.get('host') is None:
+            # Check if error is permission-related
+            error_output = (e.stdout or '') + (e.stderr or '')
+            if any(phrase in error_output for phrase in ['permission denied', 'must be owner', 'insufficient_privilege']):
+                print(f"  ⚠ {migration_file.name} feilet med permission errors", file=sys.stderr)
+                print(f"  ℹ Prøver som postgres superuser...", file=sys.stderr)
+
+                # Try as postgres superuser
+                postgres_cmd = ['sudo', '-u', 'postgres', 'psql']
+                postgres_cmd.extend([
+                    '-d', db_params['database'],
+                    '-f', str(migration_file),
+                    '-v', 'ON_ERROR_STOP=1',
+                    '-v', 'client_min_messages=notice',
+                    '-a'
+                ])
+
+                try:
+                    postgres_result = subprocess.run(
+                        postgres_cmd,
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    # Print notices and output
+                    if postgres_result.stdout:
+                        print(postgres_result.stdout, end='')
+                    if postgres_result.stderr:
+                        stderr_lines = postgres_result.stderr.split('\n')
+                        for line in stderr_lines:
+                            if 'NOTICE:' in line or 'WARNING:' in line:
+                                print(line, file=sys.stderr)
+                    print(f"  ✓ {migration_file.name} fullført som postgres superuser", file=sys.stderr)
+                    return True
+                except subprocess.CalledProcessError as postgres_e:
+                    print(f"✗ Migration failed even as postgres: {migration_file.name}", file=sys.stderr)
+                    if postgres_e.stdout:
+                        print(postgres_e.stdout, file=sys.stderr)
+                    if postgres_e.stderr:
+                        print(postgres_e.stderr, file=sys.stderr)
+                    return False
+                except FileNotFoundError:
+                    print(f"  ⚠ sudo ikke tilgjengelig, kan ikke prøve som postgres", file=sys.stderr)
+
         print(f"✗ Migration failed: {migration_file.name}", file=sys.stderr)
         if e.stdout:
             print(e.stdout, file=sys.stderr)
@@ -343,6 +405,57 @@ def run_migration(db_params: dict, migration_file: Path) -> bool:
     except FileNotFoundError:
         print("Feil: psql ikke funnet. Er PostgreSQL installert?", file=sys.stderr)
         return False
+
+
+def check_owner_membership(db_params: dict) -> bool:
+    """Verify current_user is a member of stiflyt_owner if the role exists."""
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    cmd = ['psql']
+    if db_params.get('host'):
+        cmd.extend(['-h', db_params['host']])
+    if db_params.get('port'):
+        cmd.extend(['-p', str(db_params['port'])])
+    cmd.extend([
+        '-U', db_params['user'],
+        '-d', db_params['database'],
+        '-t', '-A', '-F', '|',
+        '-c', """
+            SELECT
+                current_user,
+                EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_owner') AS owner_exists,
+                pg_has_role(current_user, 'stiflyt_owner', 'member') AS is_member;
+        """
+    ])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # If we can't check, allow migrations to proceed
+        return True
+
+    line = result.stdout.strip()
+    if not line:
+        return True
+    parts = line.split('|')
+    if len(parts) != 3:
+        return True
+    current_user, owner_exists, is_member = parts
+    if owner_exists == 't' and is_member != 't':
+        print("✗ Current role is not a member of stiflyt_owner", file=sys.stderr)
+        print(f"  current_user: {current_user}", file=sys.stderr)
+        print("  Fix (as superuser):", file=sys.stderr)
+        print(f"  GRANT stiflyt_owner TO {current_user};", file=sys.stderr)
+        return False
+    return True
 
 
 def main():
@@ -373,6 +486,10 @@ def main():
     if not migration_files:
         print(f"ℹ Ingen migrasjoner funnet i {migration_dir}")
         sys.exit(0)
+
+    # Preflight: ensure role membership for ownership
+    if not check_owner_membership(db_params):
+        sys.exit(1)
 
     print(f"==> Kjører migrasjoner for database '{db_params['database']}' ...")
     print(f"  Fant {len(migration_files)} migrasjon(er) i {migration_dir}")

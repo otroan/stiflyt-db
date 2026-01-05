@@ -4,7 +4,7 @@ DATA_DIR := data/matrikkel
 PGDATABASE ?= matrikkel
 PGHOST ?= localhost
 PGPORT ?= 5432
-PGUSER ?= $(shell whoami)
+PGUSER ?= stiflyt_reader
 
 # Virtual environment
 VENV := venv
@@ -194,12 +194,13 @@ drop-db:
 
 # Load any dataset (auto-detects PostGIS SQL or GML format)
 # Usage: make load-dataset ZIP_FILE=data/stedsnavn/file.zip TABLE=stedsnavn SRID=25833
+# Note: Uses stiflyt_updater by default (requires write permissions)
 load-dataset: ensure-db $(VENV)
 	@if [ -z "$(ZIP_FILE)" ]; then \
 		echo "Feil: ZIP_FILE må angis. Eksempel: make load-dataset ZIP_FILE=data/stedsnavn/file.zip TABLE=stedsnavn"; \
 		exit 1; \
 	fi
-	@$(PYTHON) ./scripts/load_dataset.py "$(ZIP_FILE)" $(PGDATABASE) $(TABLE) $(SRID) --drop-tables
+	@PGUSER=$${PGUSER:-stiflyt_updater} $(PYTHON) ./scripts/load_dataset.py "$(ZIP_FILE)" $(PGDATABASE) $(TABLE) $(SRID) --drop-tables
 
 # Update all datasets from config file (cron-friendly)
 # This downloads updates and reloads data, replacing old tables
@@ -212,7 +213,11 @@ db-status: $(VENV)
 
 # Inspect database schema (tables, columns, indexes, SRIDs)
 inspect-db: $(VENV)
-	@$(PYTHON) scripts/inspect_db.py $(PGDATABASE) --tables
+	@if [ "$(PGHOST)" = "localhost" ] || [ -z "$(PGHOST)" ]; then \
+		PGUSER=$(PGUSER) PGPASSWORD=$(PGPASSWORD) $(PYTHON) scripts/inspect_db.py $(PGDATABASE) --tables; \
+	else \
+		PGUSER=$(PGUSER) PGHOST=$(PGHOST) PGPORT=$(PGPORT) PGPASSWORD=$(PGPASSWORD) $(PYTHON) scripts/inspect_db.py $(PGDATABASE) --tables; \
+	fi
 
 # Run database migrations (creates indexes, updates statistics, etc.)
 # Migrations run automatically after update-datasets, but can be run manually

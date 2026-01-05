@@ -15,10 +15,12 @@ This directory contains SQL migration files that are executed after data import 
 
 Sets up database roles and permissions for secure access:
 
+- **`stiflyt_owner`** - Owns all objects (NOLOGIN)
 - **`stiflyt_updater`** - Full write access role for cron updates (`update-datasets`, migrations)
 - **`stiflyt_reader`** - Read-only access role for backend application
 
 **Important**: This migration should be run **once** after creating the database, before loading any data. It grants:
+- Ownership to `stiflyt_owner` for all schemas and objects
 - Write access to `stiflyt_updater` for all schemas (CREATE, DROP, INSERT, UPDATE, DELETE, CREATE INDEX, etc.)
 - Read-only access to `stiflyt_reader` for all schemas (SELECT only)
 - Default privileges for future objects
@@ -38,6 +40,7 @@ make setup-roles
 ALTER ROLE stiflyt_updater WITH PASSWORD 'your_secure_password';
 ALTER ROLE stiflyt_reader WITH PASSWORD 'your_secure_password';
 ```
+Note: `stiflyt_owner` is NOLOGIN and does not need a password.
 
 **For cron updates**, use `stiflyt_updater`:
 ```bash
