@@ -152,7 +152,10 @@ fresh-start:
 	@echo "==> Steg 4: Laster inn data (dette kan ta lang tid)..."
 	@PGUSER=stiflyt_updater $(MAKE) update-datasets
 	@echo ""
-	@echo "==> Steg 5: Kjør migrasjoner..."
+	@echo "==> Steg 5: Bygger links-tabell (kreves for views)..."
+	@PGUSER=stiflyt_updater $(MAKE) build-links || (echo "  ⚠ build-links feilet - migrasjoner vil prøve igjen automatisk" && true)
+	@echo ""
+	@echo "==> Steg 6: Kjør migrasjoner..."
 	@PGUSER=stiflyt_updater $(MAKE) run-migrations
 	@echo ""
 	@echo "==> Fresh start fullført!"
@@ -165,6 +168,10 @@ init-db: fresh-start
 refresh-db: $(VENV)
 	@echo "==> Refresh: Oppdaterer data og kjører migrasjoner..."
 	@PGUSER=stiflyt_updater $(MAKE) update-datasets
+	@echo ""
+	@echo "==> Bygger links-tabell (kreves for views)..."
+	@PGUSER=stiflyt_updater $(MAKE) build-links || (echo "  ⚠ build-links feilet - migrasjoner vil prøve igjen automatisk" && true)
+	@echo ""
 	@PGUSER=stiflyt_updater $(MAKE) run-migrations
 
 # Setup database roles and permissions (run once after create-db)
@@ -274,7 +281,10 @@ cron-update: $(VENV)
 	@echo "Step 1: Update datasets..."
 	@$(MAKE) update-datasets || (echo "⚠ update-datasets failed - continuing with migrations" && true)
 	@echo ""
-	@echo "Step 2: Run migrations (includes build-links if needed)..."
+	@echo "Step 2: Build links (required for views)..."
+	@$(MAKE) build-links || (echo "⚠ build-links failed - migrations will try again automatically" && true)
+	@echo ""
+	@echo "Step 3: Run migrations..."
 	@$(MAKE) run-migrations || (echo "✗ run-migrations failed" && exit 1)
 	@echo ""
 	@echo "=== cron-update pipeline completed ==="

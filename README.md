@@ -8,9 +8,28 @@ This package is designed to **keep PostGIS databases up to date** by automatical
 
 ## Quick Start
 
+### Option 1: Full Initialization (Recommended for First Time)
+
 ```bash
 # 1. Install dependencies (Ubuntu/Debian)
 #    This creates a virtual environment and installs Python packages
+make dependencies
+
+# 2. Start PostgreSQL
+sudo systemctl start postgresql
+
+# 3. Initialize database from scratch
+#    This does everything: creates DB, loads data, builds links, runs migrations
+make init-db
+
+# 4. Verify everything worked
+make db-status
+```
+
+### Option 2: Step-by-Step Setup
+
+```bash
+# 1. Install dependencies
 make dependencies
 
 # 2. Start PostgreSQL
@@ -22,9 +41,17 @@ make create-db
 # 4. Download and load datasets
 make update-datasets
 
-# 5. Verify everything worked
+# 5. Build links table (required for views)
+make build-links
+
+# 6. Run migrations (creates indexes and views)
+make run-migrations
+
+# 7. Verify everything worked
 make db-status
 ```
+
+**Note**: `init-db` is equivalent to Option 2 but in a single command. It's recommended for first-time setup.
 
 **Note**: All Makefile targets automatically use the virtual environment. For manual script execution, activate the venv first:
 ```bash
@@ -200,10 +227,12 @@ Migrations are SQL files that optimize the database for API queries after data i
 
 ### How It Works
 
-1. **Automatic Execution**: Migrations run automatically after `update-datasets` completes successfully
-2. **Manual Execution**: Run migrations manually with `make run-migrations` or `python3 scripts/run_migrations.py [database]`
-3. **Execution Order**: Migrations are executed in alphabetical order (by filename)
-4. **Idempotency**: Migrations are designed to be safe to run multiple times
+1. **Automatic Execution**: When using `init-db` or `refresh-db`, migrations run automatically after data is loaded
+2. **Build-Links Integration**: The `build-links` step runs automatically before migrations (as part of `init-db`/`refresh-db`) to ensure the `links` table exists
+3. **Manual Execution**: Run migrations manually with `make run-migrations` or `python3 scripts/run_migrations.py [database]`
+4. **Execution Order**: Migrations are executed in alphabetical order (by filename)
+5. **Idempotency**: Migrations are designed to be safe to run multiple times
+6. **Safety Net**: If `build-links` wasn't run explicitly, the migration system will automatically run it before migration 003 if the `links` table is missing
 
 ### Migration Files
 

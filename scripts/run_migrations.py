@@ -21,7 +21,7 @@ import sys
 import subprocess
 import argparse
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 def get_db_connection_params() -> dict:
@@ -396,6 +396,55 @@ def run_migration(db_params: dict, migration_file: Path) -> bool:
         return False
 
 
+def verify_critical_views(db_params: dict) -> Tuple[bool, List[str]]:
+    """Verify that critical views exist in stiflyt schema.
+
+    Args:
+        db_params: Database connection parameters
+
+    Returns:
+        Tuple of (all_exist: bool, missing_views: List[str])
+    """
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    # Critical views that should exist after migrations
+    critical_views = ['links', 'links_with_routes']
+
+    cmd = ['psql']
+    if db_params.get('host'):
+        cmd.extend(['-h', db_params['host']])
+    if db_params.get('port'):
+        cmd.extend(['-p', str(db_params['port'])])
+    cmd.extend([
+        '-U', db_params['user'],
+        '-d', db_params['database'],
+        '-t', '-A', '-F', '|',
+        '-c', f"""
+            SELECT viewname
+            FROM pg_views
+            WHERE schemaname = 'stiflyt'
+              AND viewname = ANY(ARRAY[{','.join([f"'{v}'" for v in critical_views])}]);
+        """
+    ])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        existing_views = set(line.strip() for line in result.stdout.strip().split('\n') if line.strip())
+        missing_views = [v for v in critical_views if v not in existing_views]
+        return len(missing_views) == 0, missing_views
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # If we can't check, assume they're missing (safer)
+        return False, critical_views
+
+
 def check_owner_membership(db_params: dict) -> bool:
     """Verify current_user is a member of stiflyt_owner if the role exists."""
     env = os.environ.copy()
@@ -495,8 +544,11 @@ def main():
             print(f"     ✓ build-links fullført")
         else:
             print(f"     ✗ build-links feilet", file=sys.stderr)
-            print(f"     ⚠ Migrasjon 003 vil sannsynligvis feile uten links-tabellen", file=sys.stderr)
+            print(f"     ⚠ KRITISK: Migrasjon 003 vil feile uten links-tabellen", file=sys.stderr)
+            print(f"     ⚠ Migrasjoner vil fortsette, men views vil ikke bli opprettet", file=sys.stderr)
+            print(f"     ⚠ Kjør 'make build-links' manuelt og re-run migrasjoner", file=sys.stderr)
             # Continue anyway - migration 003 will handle the error gracefully
+            # But we'll verify at the end that views were created
     elif migration_003:
         print(f"  ⊙ build-links ikke nødvendig (links-tabellen eksisterer allerede)")
 
@@ -539,6 +591,27 @@ def main():
     if failed_count > 0:
         print(f"  ✗ Feilet: {failed_count}")
         print(f"  Feilede migrasjoner: {', '.join(failed_migrations)}")
+
+    # Verify critical views exist (even if migrations "succeeded")
+    # This catches cases where migrations skip silently (e.g., if build-links failed)
+    print(f"==> Verifiserer kritiske views...")
+    all_views_exist, missing_views = verify_critical_views(db_params)
+    if all_views_exist:
+        print(f"  ✓ Alle kritiske views eksisterer")
+    else:
+        print(f"  ✗ KRITISK: Manglende views i stiflyt schema:", file=sys.stderr)
+        for view in missing_views:
+            print(f"     - stiflyt.{view}", file=sys.stderr)
+        print(f"", file=sys.stderr)
+        print(f"  ⚠ Dette kan bety at build-links feilet eller ikke kjørte", file=sys.stderr)
+        print(f"  ⚠ Løsning:", file=sys.stderr)
+        print(f"     1. Kjør: make build-links", file=sys.stderr)
+        print(f"     2. Re-run: make run-migrations", file=sys.stderr)
+        # Don't exit with error if migrations themselves succeeded
+        # But warn loudly so user knows something is wrong
+        if failed_count == 0:
+            print(f"", file=sys.stderr)
+            print(f"  ⚠ Migrasjoner fullført, men views mangler - dette er IKKE normalt!", file=sys.stderr)
 
     if failed_count > 0:
         sys.exit(1)

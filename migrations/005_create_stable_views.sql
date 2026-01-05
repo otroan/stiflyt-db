@@ -132,7 +132,25 @@ BEGIN
                     view_schema, tbl_name, dynamic_schema, tbl_name);
                 RAISE NOTICE 'Created stable view: %.% -> %.%', view_schema, tbl_name, dynamic_schema, tbl_name;
             ELSE
-                RAISE NOTICE 'View %.% does not exist yet (may be created by later migrations), skipping', dynamic_schema, tbl_name;
+                -- Check if this is a critical view that should exist
+                IF tbl_name IN ('links_with_routes', 'link_ruteinfo') THEN
+                    -- Check if links table exists (if it does, views should have been created by migration 003)
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_schema = dynamic_schema AND table_name = 'links'
+                    ) THEN
+                        RAISE WARNING 'KRITISK: View %.% does not exist, but %.links table exists!',
+                                     dynamic_schema, tbl_name, dynamic_schema;
+                        RAISE WARNING 'This indicates migration 003 may have failed or been skipped.';
+                        RAISE WARNING 'Solution: Check migration logs and ensure build-links ran successfully.';
+                    ELSE
+                        RAISE NOTICE 'View %.% does not exist (links table also missing - may be created later)',
+                                   dynamic_schema, tbl_name;
+                    END IF;
+                ELSE
+                    RAISE NOTICE 'View %.% does not exist yet (may be created by later migrations), skipping',
+                               dynamic_schema, tbl_name;
+                END IF;
             END IF;
         END LOOP;
     END IF;

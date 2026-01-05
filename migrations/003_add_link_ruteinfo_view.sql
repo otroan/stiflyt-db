@@ -27,11 +27,26 @@ BEGIN
     ) INTO links_exists;
 
     IF NOT links_exists THEN
-        RAISE WARNING 'Table %.links does not exist. Skipping view creation.', schema_name;
-        RAISE NOTICE 'Note: links table should be created automatically by the migrations system before this migration runs.';
-        RAISE NOTICE 'If this warning appears, build-links may have failed. Check migration logs for details.';
-        RAISE NOTICE 'You can also run "make build-links" manually to create the links table.';
-        RETURN;
+        -- If schema exists but links table doesn't, this is an error condition
+        -- (build-links should have run but didn't or failed)
+        -- However, we check if fotrute table exists to distinguish between:
+        -- 1. No turrutebasen data loaded (fotrute doesn't exist) - skip gracefully
+        -- 2. Data loaded but build-links failed (fotrute exists but links doesn't) - fail hard
+        IF EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = schema_name AND table_name = 'fotrute'
+        ) THEN
+            -- Data is loaded but links table is missing - this is an error
+            RAISE EXCEPTION 'KRITISK: Table %.links does not exist, but %.fotrute exists. '
+                          || 'This indicates build-links failed or did not run.', schema_name, schema_name
+                USING HINT = 'Links table should be created automatically by build-links before this migration runs. '
+                           || 'Solution: Run "make build-links" manually, then re-run migrations.';
+        ELSE
+            -- No turrutebasen data loaded yet - skip gracefully
+            RAISE NOTICE 'Table %.links does not exist and %.fotrute also missing. '
+                      || 'Skipping view creation (no turrutebasen data loaded yet).', schema_name, schema_name;
+            RETURN;
+        END IF;
     END IF;
 
     RAISE NOTICE 'Creating link_ruteinfo view in schema: %', schema_name;
