@@ -98,10 +98,30 @@ BEGIN
                 -- Drop existing view if it exists (for idempotency)
                 EXECUTE format('DROP VIEW IF EXISTS %I.%I CASCADE', view_schema, tbl_name);
 
-                -- Create view pointing to current dynamic schema
-                EXECUTE format('CREATE VIEW %I.%I AS SELECT * FROM %I.%I',
-                    view_schema, tbl_name, dynamic_schema, tbl_name);
-                RAISE NOTICE 'Created stable view: %.% -> %.%', view_schema, tbl_name, dynamic_schema, tbl_name;
+                -- Special handling for nodes table: alias id to node_id for consistency
+                IF tbl_name = 'nodes' THEN
+                    -- Check if id column exists (it should)
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = dynamic_schema
+                          AND table_name = 'nodes'
+                          AND column_name = 'id'
+                    ) THEN
+                        EXECUTE format('CREATE VIEW %I.%I AS SELECT id AS node_id, geom, geom_hash FROM %I.%I',
+                            view_schema, tbl_name, dynamic_schema, tbl_name);
+                        RAISE NOTICE 'Created stable view: %.% -> %.% (with id -> node_id alias)', view_schema, tbl_name, dynamic_schema, tbl_name;
+                    ELSE
+                        -- Fallback to SELECT * if id column doesn't exist (shouldn't happen)
+                        EXECUTE format('CREATE VIEW %I.%I AS SELECT * FROM %I.%I',
+                            view_schema, tbl_name, dynamic_schema, tbl_name);
+                        RAISE NOTICE 'Created stable view: %.% -> %.%', view_schema, tbl_name, dynamic_schema, tbl_name;
+                    END IF;
+                ELSE
+                    -- For other tables, use SELECT *
+                    EXECUTE format('CREATE VIEW %I.%I AS SELECT * FROM %I.%I',
+                        view_schema, tbl_name, dynamic_schema, tbl_name);
+                    RAISE NOTICE 'Created stable view: %.% -> %.%', view_schema, tbl_name, dynamic_schema, tbl_name;
+                END IF;
             ELSE
                 RAISE NOTICE 'Table/materialized view %.% does not exist, skipping', dynamic_schema, tbl_name;
             END IF;

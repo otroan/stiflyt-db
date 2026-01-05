@@ -37,14 +37,13 @@ BEGIN
             WHERE table_schema = schema_name AND table_name = 'fotrute'
         ) THEN
             -- Data is loaded but links table is missing - this is an error
-            RAISE EXCEPTION 'KRITISK: Table %.links does not exist, but %.fotrute exists. '
-                          || 'This indicates build-links failed or did not run.', schema_name, schema_name
-                USING HINT = 'Links table should be created automatically by build-links before this migration runs. '
-                           || 'Solution: Run "make build-links" manually, then re-run migrations.';
+            RAISE EXCEPTION 'KRITISK: Table %.links does not exist, but %.fotrute exists. This indicates build-links failed or did not run.',
+                          schema_name, schema_name
+                USING HINT = 'Links table should be created automatically by build-links before this migration runs. Solution: Run "make build-links" manually, then re-run migrations.';
         ELSE
             -- No turrutebasen data loaded yet - skip gracefully
-            RAISE NOTICE 'Table %.links does not exist and %.fotrute also missing. '
-                      || 'Skipping view creation (no turrutebasen data loaded yet).', schema_name, schema_name;
+            RAISE NOTICE 'Table %.links does not exist and %.fotrute also missing. Skipping view creation (no turrutebasen data loaded yet).',
+                        schema_name, schema_name;
             RETURN;
         END IF;
     END IF;
