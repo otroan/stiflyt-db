@@ -32,10 +32,10 @@
 #   area_filter: ""  # Empty = all municipalities, or specify: "Oslo", "Bergen", etc.
 #   output_dir: ./data/fkb_traktorvegsti
 
-- name: osm_norway
-  dataset: "OpenStreetMap Norway"
-  format: OSM
-  utm_zone: 25833  # EPSG:25833 (UTM zone 33N) - Target SRID for transformation
-  download_url: "https://download.geofabrik.de/europe/norway-latest.osm.pbf"
-  output_dir: ./data/osm_norway
+# - name: osm_norway
+#   dataset: "OpenStreetMap Norway"
+#   format: OSM
+#   utm_zone: 25833  # EPSG:25833 (UTM zone 33N) - Target SRID for transformation
+#   download_url: "https://download.geofabrik.de/europe/norway-latest.osm.pbf"
+#   output_dir: ./data/osm_norway
 

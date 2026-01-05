@@ -19,6 +19,7 @@ Environment variables:
     OSM2PGSQL_SCHEMA  - Target schema for osm2pgsql (default: public)
     OSM2PGSQL_PREFIX  - Table prefix for osm2pgsql (default: planet_osm)
     OSM2PGSQL_STYLE   - Path to osm2pgsql style file (optional)
+    OSM_USE_SLIM      - Use --slim mode (default: true). Set to false to avoid temp table issues
 """
 
 import os
@@ -1739,12 +1740,20 @@ def load_osm_pbf(
 
     cmd = [
         'osm2pgsql',
-        '--slim',
+    ]
+
+    # Add --slim flag only if OSM_USE_SLIM is set to true (default: true)
+    # Without --slim, osm2pgsql uses more RAM but avoids temp table issues
+    use_slim = os.environ.get('OSM_USE_SLIM', 'true').lower() in ('true', '1', 'yes', 'on')
+    if use_slim:
+        cmd.append('--slim')
+
+    cmd.extend([
         '--schema', schema,
         '--prefix', prefix,
         '-d', db_params['database'],
         '-U', db_params['user']
-    ]
+    ])
 
     if db_params.get('host'):
         cmd.extend(['-H', db_params['host']])
@@ -1759,12 +1768,111 @@ def load_osm_pbf(
         cmd.extend(['--style', style])
 
     cmd.extend(extra_args)
+
+    # Add --log-progress flag if not already present in extra_args
+    # osm2pgsql uses --log-progress, not --progress
+    if '--log-progress' not in extra_args and '--progress' not in extra_args:
+        cmd.extend(['--log-progress', 'true'])
+
     cmd.append(str(osm_file))
 
+    process = None
     try:
-        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        # Use Popen for real-time progress output
+        process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Combine stderr with stdout
+            text=True,
+            bufsize=1,  # Line buffered
+            universal_newlines=True
+        )
 
-        if result.returncode == 0:
+        # Read and print output line by line for real-time progress
+        import threading
+        import time
+
+        last_progress_line = ""
+        error_lines = []
+        line_count = 0
+        has_output = False
+
+        # Show a heartbeat indicator if no progress messages appear
+        heartbeat_counter = [0]  # Use list to allow modification from inner function
+
+        def show_heartbeat():
+            """Show heartbeat while waiting for output."""
+            time.sleep(2)  # Wait 2 seconds before showing heartbeat
+            while process.poll() is None:
+                heartbeat_counter[0] += 1
+                dots = "." * (heartbeat_counter[0] % 4)  # Rotating dots
+                print(f"\r     ⏳ Importerer{dots}", end='', flush=True)
+                time.sleep(1)
+
+        heartbeat_thread = threading.Thread(target=show_heartbeat, daemon=True)
+        heartbeat_thread.start()
+
+        # Read output line by line
+        for line in process.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+
+            line_count += 1
+            has_output = True
+            heartbeat_counter[0] = -1  # Stop heartbeat
+
+            # Filter and format osm2pgsql progress messages
+            # osm2pgsql outputs various messages - show the important ones
+            is_progress = (
+                'Reading in file' in line or
+                'Processing' in line or
+                'Node stats' in line or
+                'Way stats' in line or
+                'Relation stats' in line or
+                'Stopped table' in line or
+                'Copying' in line or
+                'Committing transaction' in line or
+                'Creating indexes' in line or
+                'Completed' in line
+            )
+
+            if is_progress:
+                # Clean up the progress line for better display
+                # osm2pgsql progress format: "Processing: Node(123456) Way(78901) Relation(1234)"
+                progress_msg = line
+                # Remove verbose prefixes if present
+                if 'Processing:' in progress_msg:
+                    progress_msg = progress_msg.replace('Processing:', 'Behandler:')
+                elif 'Reading in file:' in progress_msg:
+                    progress_msg = progress_msg.replace('Reading in file:', 'Leser fil:')
+                elif 'Node stats:' in progress_msg or 'Way stats:' in progress_msg or 'Relation stats:' in progress_msg:
+                    progress_msg = progress_msg.replace('Node stats:', 'Noder:').replace('Way stats:', 'Veier:').replace('Relation stats:', 'Relasjoner:')
+                elif 'Creating indexes' in progress_msg:
+                    progress_msg = progress_msg.replace('Creating indexes', 'Oppretter indekser')
+                elif 'Completed' in progress_msg:
+                    progress_msg = progress_msg.replace('Completed', 'Fullført')
+
+                # Print progress on same line (overwrite previous)
+                print(f"\r     {progress_msg}", end='', flush=True)
+                last_progress_line = progress_msg
+            elif 'ERROR' in line or 'FATAL' in line or 'Error' in line:
+                error_lines.append(line)
+                print(f"\n     ⚠ {line}", file=sys.stderr)
+            elif 'WARNING' in line or 'Warning' in line:
+                # Show warnings but don't clutter output
+                if 'disk I/O' not in line.lower() and 'checkpoint' not in line.lower():
+                    print(f"\n     ⚠ {line}", file=sys.stderr)
+
+        # Wait for process to complete
+        returncode = process.wait()
+
+        # Clear the progress line
+        if has_output:
+            print()  # New line after progress
+
+        if returncode == 0:
             print(f"     ✓ Lastet")
 
             # Set ownership and convert unlogged tables to logged after import
@@ -1862,10 +1970,21 @@ def load_osm_pbf(
 
             return True
         else:
-            print(f"     ✗ Feil: {result.stderr}", file=sys.stderr)
+            # Show accumulated error lines
+            if error_lines:
+                print(f"     ✗ Feil under import:", file=sys.stderr)
+                for err_line in error_lines[-5:]:  # Show last 5 error lines
+                    print(f"       {err_line}", file=sys.stderr)
+            else:
+                print(f"     ✗ Import feilet med returkode {returncode}", file=sys.stderr)
             return False
     except FileNotFoundError:
         print("     ✗ osm2pgsql ikke funnet", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"     ✗ Uventet feil: {e}", file=sys.stderr)
+        if process and process.poll() is None:
+            process.kill()
         return False
 
 

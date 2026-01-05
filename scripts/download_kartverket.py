@@ -912,7 +912,7 @@ Examples:
     return args
 
 
-def load_config_file(config_path: Path) -> List[Dict[str, Any]]:
+def load_config_file(config_path) -> List[Dict[str, Any]]:
     """Load and parse YAML configuration file.
 
     Args:
@@ -924,6 +924,10 @@ def load_config_file(config_path: Path) -> List[Dict[str, Any]]:
     if not YAML_AVAILABLE:
         print("Feil: PyYAML er ikke installert. Installer med: pip install pyyaml", file=sys.stderr)
         sys.exit(1)
+
+    # Convert to Path if it's a string
+    if isinstance(config_path, str):
+        config_path = Path(config_path)
 
     if not config_path.exists():
         print(f"Feil: Konfigurasjonsfil ikke funnet: {config_path}", file=sys.stderr)
@@ -1086,13 +1090,17 @@ def download_single_dataset(dataset_config: Dict[str, Any], index: int, total: i
         return (name, False, 0, error_msg)
 
 
-def download_from_config(config_path: Path, max_workers: Optional[int] = None) -> None:
+def download_from_config(config_path, max_workers: Optional[int] = None) -> None:
     """Download datasets from configuration file with parallel downloads.
 
     Args:
         config_path: Path to YAML configuration file
         max_workers: Maximum number of parallel downloads (default: number of datasets, max 4)
     """
+    # Convert to Path if it's a string
+    if isinstance(config_path, str):
+        config_path = Path(config_path)
+
     configs = load_config_file(config_path)
 
     if not configs:

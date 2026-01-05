@@ -56,7 +56,6 @@ BEGIN
 
         CREATE VIEW %I.osm_hiking_paths AS
         SELECT
-            ogc_fid,
             osm_id,
             name,
             highway,
@@ -68,14 +67,14 @@ BEGIN
             operator,
             ref,
             network,
-            geom,
+            way AS geom,
             -- Additional OSM tags (if present in the lines table)
             CASE
                 WHEN highway IN (''path'', ''footway'', ''track'', ''bridleway'') THEN true
                 WHEN route = ''hiking'' THEN true
                 ELSE false
             END AS is_hiking_path
-        FROM public.lines
+        FROM public.planet_osm_line
         WHERE (
             -- Primary hiking path types
             highway IN (''path'', ''footway'', ''track'', ''bridleway'')
@@ -93,7 +92,7 @@ BEGIN
                 ))
             ))
         )
-        AND geom IS NOT NULL;
+        AND way IS NOT NULL;
     ', view_schema, view_schema);
 
     RAISE NOTICE '  ✓ Created view: osm_hiking_paths';
@@ -106,7 +105,6 @@ BEGIN
 
             CREATE VIEW %I.osm_hiking_points AS
             SELECT
-                ogc_fid,
                 osm_id,
                 name,
                 tourism,
@@ -114,8 +112,8 @@ BEGIN
                 shelter_type,
                 operator,
                 ref,
-                geom
-            FROM public.points
+                way AS geom
+            FROM public.planet_osm_point
             WHERE (
                 tourism IN (''alpine_hut'', ''wilderness_hut'', ''hut'', ''camp_site'')
                 OR amenity IN (''shelter'', ''hunting_stand'')
@@ -126,7 +124,7 @@ BEGIN
                     OR name ILIKE ''%%DNT%%''
                 ))
             )
-            AND geom IS NOT NULL;
+            AND way IS NOT NULL;
         ', view_schema, view_schema);
 
         RAISE NOTICE '  ✓ Created view: osm_hiking_points';
@@ -216,7 +214,6 @@ BEGIN
 
         CREATE VIEW %I.osm_paths_with_matches AS
         SELECT
-            o.ogc_fid,
             o.osm_id,
             o.name AS osm_name,
             o.highway,
@@ -226,7 +223,7 @@ BEGIN
             o.route,
             o.operator AS osm_operator,
             o.ref AS osm_ref,
-            o.geom AS osm_geom,
+            o.way AS osm_geom,
             m.id AS match_id,
             m.fotrute_objid,
             m.match_confidence,
