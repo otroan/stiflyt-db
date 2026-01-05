@@ -203,11 +203,44 @@ BEGIN
         END IF;
     END LOOP;
 
+    -- Create stable views for OSM tables from public schema (if they exist)
+    -- OSM data is loaded into public schema, but we create views in stiflyt for consistency
+    FOR tbl_name IN
+        SELECT unnest(ARRAY[
+            'osm_hiking_paths',
+            'osm_hiking_points',
+            'osm_paths_with_matches',
+            'osm_path_matches',
+            'osm_changesets'
+        ])
+    LOOP
+        -- Check if view/table exists in stiflyt schema (created by migration 006)
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.views v
+            WHERE v.table_schema = view_schema
+              AND v.table_name = tbl_name
+            UNION ALL
+            SELECT 1
+            FROM information_schema.tables t
+            WHERE t.table_schema = view_schema
+              AND t.table_name = tbl_name
+              AND t.table_type = 'BASE TABLE'
+        ) INTO view_exists;
+
+        IF view_exists THEN
+            RAISE NOTICE 'OSM view/table %.% already exists (created by migration 006)', view_schema, tbl_name;
+        ELSE
+            RAISE NOTICE 'OSM view/table %.% does not exist yet (will be created by migration 006)', view_schema, tbl_name;
+        END IF;
+    END LOOP;
+
     RAISE NOTICE '=== Stable views created successfully ===';
     RAISE NOTICE 'Backend can now use fixed schema name: stiflyt';
     RAISE NOTICE 'Turrutebasen examples: SELECT * FROM stiflyt.fotrute; SELECT * FROM stiflyt.links;';
     RAISE NOTICE 'Matrikkel examples: SELECT * FROM stiflyt.teig; SELECT * FROM stiflyt.matrikkelenhet;';
     RAISE NOTICE 'Stedsnavn examples: SELECT * FROM stiflyt.stedsnavn; SELECT * FROM stiflyt.skrivemate;';
+    RAISE NOTICE 'OSM examples: SELECT * FROM stiflyt.osm_hiking_paths; SELECT * FROM stiflyt.osm_paths_with_matches;';
 
 EXCEPTION WHEN OTHERS THEN
     RAISE WARNING 'Error creating stable views: %', SQLERRM;

@@ -69,6 +69,11 @@ def detect_format(extract_dir: Path) -> Tuple[str, List[Path]]:
     if gdb_dirs:
         return ('FGDB', sorted(gdb_dirs))
 
+    # Check for OSM PBF files
+    osm_files = list(extract_dir.rglob('*.osm.pbf'))
+    if osm_files:
+        return ('OSM', osm_files)
+
     # Could not detect format
     return (None, [])
 
@@ -85,6 +90,7 @@ def detect_format_from_zip(zip_path: Path) -> Tuple[Optional[str], List[str]]:
     sql_files = []
     gml_files = []
     gdb_entries = []
+    osm_files = []
 
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
@@ -95,7 +101,12 @@ def detect_format_from_zip(zip_path: Path) -> Tuple[Optional[str], List[str]]:
                     gml_files.append(name)
                 elif '.gdb/' in name or name.endswith('.gdbtable'):
                     gdb_entries.append(name)
+                elif name.endswith('.osm.pbf'):
+                    osm_files.append(name)
     except zipfile.BadZipFile:
+        # Check if it's a standalone OSM PBF file (not a ZIP)
+        if zip_path.suffixes == ['.osm', '.pbf'] or zip_path.name.endswith('.osm.pbf'):
+            return ('OSM', [str(zip_path)])
         return None, []
 
     if sql_files:
@@ -104,7 +115,12 @@ def detect_format_from_zip(zip_path: Path) -> Tuple[Optional[str], List[str]]:
         return ('GML', gml_files)
     elif gdb_entries:
         return ('FGDB', gdb_entries)
+    elif osm_files:
+        return ('OSM', osm_files)
     else:
+        # Check if the file itself is an OSM PBF (not a ZIP)
+        if zip_path.suffixes == ['.osm', '.pbf'] or zip_path.name.endswith('.osm.pbf'):
+            return ('OSM', [str(zip_path)])
         return None, []
 
 
@@ -1651,6 +1667,215 @@ def load_fgdb(db_params: dict, gdb_dirs: List[Path], target_srid: Optional[int],
     return success_count > 0
 
 
+def load_osm_pbf(
+    db_params: dict,
+    osm_file: Path,
+    target_srid: Optional[int],
+    staging_schema: Optional[str],
+    drop_tables: bool = False
+) -> bool:
+    """Load OSM PBF file using ogr2ogr.
+
+    OSM PBF files contain multiple layers (points, lines, multipolygons, etc.)
+    that ogr2ogr will import as separate tables.
+
+    Args:
+        db_params: Database connection parameters
+        osm_file: Path to OSM PBF file
+        target_srid: Target SRID for transformation
+        staging_schema: Schema name for staging (or None for public)
+        drop_tables: If True, drop existing tables before loading
+    """
+    if not check_ogr2ogr():
+        print("Feil: ogr2ogr ikke funnet. Installer GDAL:", file=sys.stderr)
+        print("  Ubuntu/Debian: sudo apt-get install gdal-bin", file=sys.stderr)
+        print("  macOS: brew install gdal", file=sys.stderr)
+        return False
+
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    # When host is None, unset PGHOST to ensure Unix socket is used
+    if db_params.get('host') is None:
+        env.pop('PGHOST', None)
+        env.pop('PGPORT', None)
+
+    # Build connection string
+    conn_parts = []
+    if db_params.get('host'):
+        conn_parts.append(f"host={db_params['host']}")
+        if db_params.get('port'):
+            conn_parts.append(f"port={db_params['port']}")
+    conn_parts.append(f"user={db_params['user']}")
+    conn_parts.append(f"dbname={db_params['database']}")
+    if db_params.get('password'):
+        conn_parts.append(f"password={db_params['password']}")
+    conn_str = "PG:" + " ".join(conn_parts)
+
+    # Clean up staging schema if it exists (from previous failed/aborted imports)
+    if staging_schema:
+        print(f"  -> Rydder opp i staging schema {staging_schema} (hvis eksisterer)...")
+        drop_schema_sql = f"DROP SCHEMA IF EXISTS {staging_schema} CASCADE;"
+        try:
+            drop_cmd = ['psql']
+            if db_params.get('host'):
+                drop_cmd.extend(['-h', db_params['host']])
+            if db_params.get('port'):
+                drop_cmd.extend(['-p', str(db_params['port'])])
+            drop_cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q', '-c', drop_schema_sql])
+            subprocess.run(drop_cmd, env=env, capture_output=True, check=False)
+            print("     ✓ Staging schema ryddet")
+        except Exception as e:
+            print(f"     ⚠ Kunne ikke rydde staging schema (fortsetter): {e}")
+
+        # Create staging schema for fresh import
+        print(f"  -> Oppretter staging schema {staging_schema}...")
+        if not ensure_schema_exists(db_params, staging_schema):
+            print("     ✗ Kunne ikke opprette staging schema", file=sys.stderr)
+            return False
+        print("     ✓ Staging schema opprettet")
+
+    print(f"  -> Laster {osm_file.name} (OSM PBF) ...")
+    print("     OSM PBF filer inneholder flere lag (points, lines, multipolygons, etc.)")
+
+    cmd = [
+        'ogr2ogr',
+        '-f', 'PostgreSQL',
+        conn_str,
+        str(osm_file),
+        '-nlt', 'PROMOTE_TO_MULTI',
+        '-lco', 'GEOMETRY_NAME=geom',
+        '-lco', 'FID=ogc_fid',
+        '-lco', 'SPATIAL_INDEX=NO',  # Deaktiver indekser under import for raskere import
+        '-lco', 'OVERWRITE=YES' if drop_tables else 'OVERWRITE=NO',
+        '-lco', 'UNLOGGED=YES',  # Bruk unlogged tables for raskere import
+        '--config', 'PG_USE_COPY', 'YES',  # hurtigere innlasting
+        '-gt', '500000',  # større batcher til COPY
+        '-progress',
+        '-skipfailures',
+        '-overwrite' if drop_tables else '-append'
+    ]
+
+    if staging_schema:
+        cmd.extend(['-lco', f"SCHEMA={staging_schema}"])
+
+    if target_srid:
+        cmd.extend(['-t_srs', f'EPSG:{target_srid}'])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            env=env,
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode == 0:
+            print(f"     ✓ Lastet")
+
+            # Set ownership and convert unlogged tables to logged after import
+            if staging_schema:
+                print("  -> Setter eierskap til stiflyt_owner...")
+                try:
+                    owner_cmd = ['psql']
+                    if db_params.get('host'):
+                        owner_cmd.extend(['-h', db_params['host']])
+                    if db_params.get('port'):
+                        owner_cmd.extend(['-p', str(db_params['port'])])
+                    owner_cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q', '-c',
+                        f"""
+                        DO $$
+                        BEGIN
+                            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_owner') THEN
+                                BEGIN
+                                    EXECUTE 'SET ROLE stiflyt_owner';
+                                EXCEPTION WHEN insufficient_privilege THEN
+                                    RAISE NOTICE 'Could not SET ROLE stiflyt_owner (not member)';
+                                END;
+                            END IF;
+                        END $$;
+
+                        DO $$
+                        DECLARE
+                            r record;
+                        BEGIN
+                            -- Set ownership of all tables
+                            FOR r IN
+                                SELECT tablename
+                                FROM pg_tables
+                                WHERE schemaname = '{staging_schema}'
+                            LOOP
+                                BEGIN
+                                    EXECUTE format('ALTER TABLE %I.%I OWNER TO stiflyt_owner', '{staging_schema}', r.tablename);
+                                EXCEPTION WHEN OTHERS THEN
+                                    RAISE NOTICE 'Could not set owner for table %.%: %', '{staging_schema}', r.tablename, SQLERRM;
+                                END;
+                            END LOOP;
+
+                            -- Set ownership of all sequences
+                            FOR r IN
+                                SELECT sequence_name
+                                FROM information_schema.sequences
+                                WHERE sequence_schema = '{staging_schema}'
+                            LOOP
+                                BEGIN
+                                    EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO stiflyt_owner', '{staging_schema}', r.sequence_name);
+                                EXCEPTION WHEN OTHERS THEN
+                                    RAISE NOTICE 'Could not set owner for sequence %.%: %', '{staging_schema}', r.sequence_name, SQLERRM;
+                                END;
+                            END LOOP;
+                        END $$;
+
+                        RESET ROLE;
+                        """])
+                    subprocess.run(owner_cmd, env=env, capture_output=True, check=False)
+                    print("     ✓ Eierskap satt")
+                except Exception as e:
+                    print(f"     ⚠ Kunne ikke sette eierskap (fortsetter): {e}")
+
+                print("  -> Konverterer unlogged tables til logged...")
+                try:
+                    convert_cmd = ['psql']
+                    if db_params.get('host'):
+                        convert_cmd.extend(['-h', db_params['host']])
+                    if db_params.get('port'):
+                        convert_cmd.extend(['-p', str(db_params['port'])])
+                    convert_cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q', '-c',
+                        f"""
+                        DO $$
+                        DECLARE
+                            r record;
+                        BEGIN
+                            FOR r IN
+                                SELECT tablename
+                                FROM pg_tables
+                                WHERE schemaname = '{staging_schema}'
+                            LOOP
+                                EXECUTE format('ALTER TABLE %I.%I SET LOGGED', '{staging_schema}', r.tablename);
+                            END LOOP;
+                        END $$;
+                        """])
+                    subprocess.run(convert_cmd, env=env, capture_output=True, check=False)
+                    print("     ✓ Tables konvertert til logged")
+                except Exception as e:
+                    print(f"     ⚠ Kunne ikke konvertere tables (fortsetter): {e}")
+
+                print("  -> Bygger spatial-indekser (dette kan ta noen minutter)...")
+                if create_missing_spatial_indexes(db_params, schemas=[staging_schema]):
+                    print("     ✓ Indekser bygget")
+                else:
+                    print("     ⚠ Kunne ikke bygge alle indekser (kan bygges manuelt senere)")
+
+            return True
+        else:
+            print(f"     ✗ Feil: {result.stderr}", file=sys.stderr)
+            return False
+    except FileNotFoundError:
+        print("     ✗ ogr2ogr ikke funnet", file=sys.stderr)
+        return False
+
+
 def load_dataset(
     zip_path: Path,
     database: str,
@@ -1660,10 +1885,10 @@ def load_dataset(
     stream: bool = True,
     append: bool = False
 ) -> bool:
-    """Load dataset from ZIP file into PostGIS database.
+    """Load dataset from ZIP file or standalone file into PostGIS database.
 
     Args:
-        zip_path: Path to ZIP file
+        zip_path: Path to ZIP file or standalone file (e.g., .osm.pbf)
         database: Database name
         table_name: Table name (required for GML, auto-detected for PostGIS SQL)
         target_srid: Target SRID for transformation (default: 25833)
@@ -1697,6 +1922,30 @@ def load_dataset(
         target_srid = int(os.environ.get('TARGET_SRID', '25833'))
     if table_name is None:
         table_name = zip_path.stem.lower().replace('-', '_')
+
+    # Check if this is a standalone OSM PBF file (not a ZIP)
+    if zip_path.suffixes == ['.osm', '.pbf'] or zip_path.name.endswith('.osm.pbf'):
+        print(f"==> Detektert OSM PBF fil: {zip_path.name}")
+        print(f"==> Sjekker PostGIS extension i database '{db_params['database']}' ...")
+        if not ensure_postgis_extension(db_params):
+            return False
+        print("  ✓ PostGIS extension klar")
+
+        staging_schema = f"staging_{sanitize_identifier(table_name)}"
+        if not ensure_schema_exists(db_params, staging_schema):
+            return False
+
+        if load_osm_pbf(db_params, zip_path, target_srid, staging_schema, drop_tables):
+            print(f"==> Ferdig. OSM PBF fil lastet inn")
+            print(f"==> Flytter staging-schema {staging_schema} til public ...")
+            move_schema_objects(db_params, staging_schema, 'public')
+            grant_privileges_for_schema(db_params, 'public')
+            print("==> Bygger manglende spatial-indekser ...")
+            create_missing_spatial_indexes(db_params)
+            analyze_tables(db_params, schemas=['public'])
+            return True
+        else:
+            return False
 
     # Try streaming first (no extraction)
     if stream:
@@ -1767,6 +2016,9 @@ def load_dataset(
             elif format_type == 'FGDB':
                 print("  ℹ FGDB oppdaget. Streaming støttes ikke, prøver med ekstraksjon ...")
                 # fall through to extraction
+            elif format_type == 'OSM':
+                print("  ℹ OSM PBF oppdaget i ZIP. Prøver med ekstraksjon ...")
+                # fall through to extraction
 
     # Fallback: Extract ZIP file (original method)
     extract_dir = zip_path.parent / f"{zip_path.stem}_extracted"
@@ -1780,7 +2032,7 @@ def load_dataset(
 
         if not format_type:
             print(f"Feil: Kunne ikke detektere format i {zip_path}", file=sys.stderr)
-            print("Forventet SQL (.sql), GML (.gml) eller FileGDB (.gdb)", file=sys.stderr)
+            print("Forventet SQL (.sql), GML (.gml), FileGDB (.gdb) eller OSM PBF (.osm.pbf)", file=sys.stderr)
             return False
 
         print(f"  ✓ Detektert format: {format_type}")
@@ -1793,6 +2045,10 @@ def load_dataset(
                 return False
         elif format_type == 'FGDB':
             staging_schema = f"staging_{sanitize_identifier(zip_path.stem)}"
+            if not ensure_schema_exists(db_params, staging_schema):
+                return False
+        elif format_type == 'OSM':
+            staging_schema = f"staging_{sanitize_identifier(table_name)}"
             if not ensure_schema_exists(db_params, staging_schema):
                 return False
 
@@ -1857,6 +2113,27 @@ def load_dataset(
                 return True
             else:
                 print("Feil: Kunne ikke laste inn FGDB", file=sys.stderr)
+                return False
+
+        elif format_type == 'OSM':
+            if len(files) > 0:
+                # Use first OSM file (typically only one)
+                osm_file = files[0]
+                if load_osm_pbf(db_params, osm_file, target_srid, staging_schema, drop_tables):
+                    print(f"==> Ferdig. OSM PBF fil lastet inn")
+                    if staging_schema:
+                        print(f"==> Flytter staging-schema {staging_schema} til public ...")
+                        move_schema_objects(db_params, staging_schema, 'public')
+                        grant_privileges_for_schema(db_params, 'public')
+                    print("==> Bygger manglende spatial-indekser ...")
+                    create_missing_spatial_indexes(db_params)
+                    analyze_tables(db_params, schemas=['public'])
+                    return True
+                else:
+                    print("Feil: Kunne ikke laste inn OSM PBF", file=sys.stderr)
+                    return False
+            else:
+                print("Feil: Ingen OSM PBF filer funnet", file=sys.stderr)
                 return False
 
         return False

@@ -336,6 +336,52 @@ def check_import_needed(
 
             return False, f"Table {table_name} is up-to-date"
 
+        elif format_type == 'OSM':
+            # For OSM, ogr2ogr creates multiple tables (points, lines, multipolygons, etc.)
+            # Check if any OSM-related tables exist
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT tablename
+                    FROM pg_tables
+                    WHERE schemaname = 'public'
+                      AND (tablename LIKE '%points%' OR tablename LIKE '%lines%'
+                           OR tablename LIKE '%multipolygons%' OR tablename LIKE '%other_relations%')
+                    LIMIT 1
+                """)
+                existing_tables = [row[0] for row in cur.fetchall()]
+
+                if not existing_tables:
+                    return True, f"OSM tables do not exist"
+
+                # Check modification time of any OSM table
+                cur.execute("""
+                    SELECT GREATEST(
+                        COALESCE(last_vacuum, '1970-01-01'::timestamp),
+                        COALESCE(last_autovacuum, '1970-01-01'::timestamp),
+                        COALESCE(last_analyze, '1970-01-01'::timestamp),
+                        COALESCE(last_autoanalyze, '1970-01-01'::timestamp)
+                    )
+                    FROM pg_stat_user_tables
+                    WHERE schemaname = 'public'
+                      AND (relname LIKE '%points%' OR relname LIKE '%lines%'
+                           OR relname LIKE '%multipolygons%' OR relname LIKE '%other_relations%')
+                    ORDER BY GREATEST(
+                        COALESCE(last_vacuum, '1970-01-01'::timestamp),
+                        COALESCE(last_autovacuum, '1970-01-01'::timestamp),
+                        COALESCE(last_analyze, '1970-01-01'::timestamp),
+                        COALESCE(last_autoanalyze, '1970-01-01'::timestamp)
+                    ) ASC
+                    LIMIT 1
+                """)
+
+                result = cur.fetchone()
+                if result and result[0]:
+                    mod_timestamp = result[0].timestamp()
+                    if zip_mtime > mod_timestamp:
+                        return True, f"OSM PBF file ({datetime.fromtimestamp(zip_mtime)}) is newer than tables ({datetime.fromtimestamp(mod_timestamp)})"
+
+                return False, "OSM tables are up-to-date"
+
         elif format_type == 'FGDB':
             # For FGDB, we don't know table names in advance without extracting
             # Check if expected tables exist (for known datasets like stedsnavn)
@@ -570,6 +616,46 @@ def load_fgdb_dataset(zip_file: Path, database: str, srid: int, log_file: Path) 
         return False
 
 
+def load_osm_dataset(osm_file: Path, database: str, srid: int, log_file: Path, drop_tables: bool = False) -> bool:
+    """Load OSM PBF dataset using unified loader."""
+    try:
+        if osm_file is None:
+            log(f"✗ Feil: osm_file er None", log_file)
+            return False
+
+        if not isinstance(osm_file, Path):
+            osm_file = Path(osm_file)
+
+        osm_file = osm_file.resolve()
+
+        if not osm_file.exists():
+            log(f"✗ Feil: OSM PBF fil eksisterer ikke: {osm_file}", log_file)
+            return False
+
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+
+        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+            success = load_dataset(osm_file, database, target_srid=srid, drop_tables=drop_tables, stream=False)
+
+        stdout_output = stdout_capture.getvalue()
+        stderr_output = stderr_capture.getvalue()
+
+        with open(log_file, 'a') as f:
+            if stdout_output:
+                f.write(stdout_output)
+            if stderr_output:
+                f.write(stderr_output)
+
+        return success
+    except Exception as e:
+        log(f"✗ Failed to load OSM dataset: {e}", log_file)
+        return False
+
+
 def main():
     """Main function."""
     import argparse
@@ -645,10 +731,18 @@ def main():
 
         log(f"  -> Processing {name} ({format_type} format)...", log_file)
 
-        # Find ZIP files in output directory
+        # Find files in output directory (ZIP files or OSM PBF files)
         zip_files = list(output_dir.glob('*.zip'))
+        osm_files = list(output_dir.glob('*.osm.pbf'))
 
-        if not zip_files:
+        # For OSM format, use .osm.pbf files; otherwise use ZIP files
+        if format_type == 'OSM':
+            zip_files = osm_files
+            if not zip_files:
+                log(f"    ⚠ No OSM PBF files found in {output_dir} - skipping", log_file)
+                failed_count += 1
+                continue
+        elif not zip_files:
             log(f"    ⚠ No ZIP files found in {output_dir} - skipping", log_file)
             failed_count += 1
             continue
@@ -772,6 +866,21 @@ def main():
                     srid = 25833  # Default
 
                 if load_fgdb_dataset(zip_file, database, srid, log_file):
+                    log(f"    ✓ {name} loaded successfully", log_file)
+                    success_count += 1
+                else:
+                    log(f"    ✗ Failed to load {name}", log_file)
+                    failed_count += 1
+
+            elif format_type == 'OSM':
+                if isinstance(utm_zone, int):
+                    srid = utm_zone
+                elif isinstance(utm_zone, str) and utm_zone.isdigit():
+                    srid = int(utm_zone)
+                else:
+                    srid = 25833  # Default
+
+                if load_osm_dataset(zip_file, database, srid, log_file, drop_tables=True):
                     log(f"    ✓ {name} loaded successfully", log_file)
                     success_count += 1
                 else:
