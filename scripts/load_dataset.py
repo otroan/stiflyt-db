@@ -240,11 +240,13 @@ def drop_schemas_by_prefix(db_params: dict, schema_prefix: str) -> bool:
     # Query for schemas matching the prefix pattern
     # Exclude system schemas
     find_schemas_sql = f"""
+        {role_preamble_sql()}
         SELECT nspname
         FROM pg_namespace
         WHERE nspname LIKE '{schema_prefix}_%'
         AND nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
         ORDER BY nspname;
+        {role_reset_sql()}
     """
 
     try:
@@ -266,7 +268,12 @@ def drop_schemas_by_prefix(db_params: dict, schema_prefix: str) -> bool:
         print(f"  Fant {len(schema_names)} schema(er) med prefix '{schema_prefix}': {', '.join(schema_names)}")
 
         # Drop each schema (CASCADE will drop all tables in the schema)
-        drop_sql = '; '.join([f'DROP SCHEMA IF EXISTS "{name}" CASCADE' for name in schema_names]) + ';'
+        drop_sql = (
+            role_preamble_sql()
+            + '; '.join([f'DROP SCHEMA IF EXISTS "{name}" CASCADE' for name in schema_names])
+            + ';'
+            + role_reset_sql()
+        )
 
         # Remove -t flag for drop command (we want to see output)
         drop_cmd = cmd[:-1]  # Remove -t flag
@@ -302,7 +309,12 @@ def drop_tables(db_params: dict, table_names: List[str]) -> bool:
     cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q'])
 
     # Build SQL to drop tables
-    drop_sql = '; '.join([f'DROP TABLE IF EXISTS {name} CASCADE' for name in table_names]) + ';'
+    drop_sql = (
+        role_preamble_sql()
+        + '; '.join([f'DROP TABLE IF EXISTS {name} CASCADE' for name in table_names])
+        + ';'
+        + role_reset_sql()
+    )
 
     try:
         result = subprocess.run(
@@ -323,6 +335,121 @@ def sanitize_identifier(name: str) -> str:
     """Sanitize a string to be a valid PostgreSQL identifier (lowercase, alnum + underscore)."""
     return re.sub(r'[^a-zA-Z0-9_]', '_', name).lower()
 
+
+def role_preamble_sql() -> str:
+    """Return SQL that attempts to SET ROLE stiflyt_owner if available."""
+    return """
+    DO $$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_owner') THEN
+            BEGIN
+                EXECUTE 'SET ROLE stiflyt_owner';
+            EXCEPTION WHEN insufficient_privilege THEN
+                RAISE NOTICE 'Could not SET ROLE stiflyt_owner (not member)';
+            END;
+        END IF;
+    END $$;
+    """
+
+
+def role_reset_sql() -> str:
+    """Return SQL that resets the active role."""
+    return "RESET ROLE;\n"
+
+
+def grant_privileges_for_schema(db_params: dict, schema_name: Optional[str]) -> bool:
+    """Grant privileges for a specific schema using grant_schema_privileges() when available."""
+    if not schema_name:
+        return True
+
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    cmd = ['psql']
+    if db_params.get('host'):
+        cmd.extend(['-h', db_params['host']])
+    if db_params.get('port'):
+        cmd.extend(['-p', str(db_params['port'])])
+    cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q'])
+
+    sql = f"""
+    {role_preamble_sql()}
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM pg_proc p
+            JOIN pg_namespace n ON p.pronamespace = n.oid
+            WHERE n.nspname = 'public' AND p.proname = 'grant_schema_privileges'
+        ) THEN
+            BEGIN
+                PERFORM grant_schema_privileges('{schema_name}');
+            EXCEPTION WHEN insufficient_privilege THEN
+                RAISE NOTICE 'Could not grant privileges for schema % (not owner)', '{schema_name}';
+            END;
+        END IF;
+    END $$;
+    {role_reset_sql()}
+    """
+
+    try:
+        subprocess.run(
+            cmd,
+            input=sql,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"  ⚠ Kunne ikke sette privileges for schema {schema_name}: {e.stderr}", file=sys.stderr)
+        return False
+
+
+def run_psql_stream(
+    db_params: dict,
+    stream,
+    pre_sql: str = "",
+    post_sql: str = ""
+) -> subprocess.CompletedProcess:
+    """Run psql with streamed input, optionally prepending/appending SQL."""
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    cmd = ['psql', '-v', 'ON_ERROR_STOP=1']
+    if db_params.get('host'):
+        cmd.extend(['-h', db_params['host']])
+    if db_params.get('port'):
+        cmd.extend(['-p', str(db_params['port'])])
+    cmd.extend(['-U', db_params['user'], '-d', db_params['database']])
+
+    process = subprocess.Popen(
+        cmd,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+
+    try:
+        if pre_sql:
+            process.stdin.write(pre_sql.encode('utf-8'))
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            process.stdin.write(chunk)
+        if post_sql:
+            process.stdin.write(post_sql.encode('utf-8'))
+        process.stdin.close()
+    except Exception:
+        process.kill()
+        raise
+
+    stdout, stderr = process.communicate()
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
 def ensure_schema_exists(db_params: dict, schema: str) -> bool:
     """Create schema if not exists and grant privileges to roles.
@@ -826,18 +953,6 @@ def load_postgis_sql_from_zip_stream(
                 else:
                     print("  ⚠ Kunne ikke slette alle tabeller (fortsetter likevel)")
 
-    env = os.environ.copy()
-    if db_params.get('password'):
-        env['PGPASSWORD'] = db_params['password']
-
-    # Build psql command
-    psql_cmd = ['psql']
-    if db_params.get('host'):
-        psql_cmd.extend(['-h', db_params['host']])
-    if db_params.get('port'):
-        psql_cmd.extend(['-p', str(db_params['port'])])
-    psql_cmd.extend(['-U', db_params['user'], '-d', db_params['database']])
-
     success_count = 0
     for sql_file in sql_files:
         print(f"  -> Laster {sql_file} (direkte fra ZIP) ...")
@@ -846,19 +961,25 @@ def load_postgis_sql_from_zip_stream(
             # Read from ZIP and pipe to psql
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 with zip_ref.open(sql_file) as zip_file:
-                    psql_proc = subprocess.run(
-                        psql_cmd,
-                        stdin=zip_file,
-                        env=env,
-                        capture_output=True,
-                        text=False,  # Binary mode for stdin
-                        check=True
+                    psql_proc = run_psql_stream(
+                        db_params,
+                        zip_file,
+                        pre_sql=role_preamble_sql(),
+                        post_sql=role_reset_sql()
                     )
+                    if psql_proc.returncode != 0:
+                        raise subprocess.CalledProcessError(
+                            psql_proc.returncode,
+                            psql_proc.args,
+                            output=psql_proc.stdout,
+                            stderr=psql_proc.stderr
+                        )
 
             success_count += 1
             print(f"     ✓ Lastet")
         except subprocess.CalledProcessError as e:
-            print(f"     ✗ Feil ved lasting: {e.stderr.decode() if e.stderr else str(e)}", file=sys.stderr)
+            stderr_text = e.stderr.decode() if isinstance(e.stderr, (bytes, bytearray)) else e.stderr
+            print(f"     ✗ Feil ved lasting: {stderr_text if stderr_text else str(e)}", file=sys.stderr)
             return False
         except Exception as e:
             print(f"     ✗ Feil: {e}", file=sys.stderr)
@@ -908,12 +1029,13 @@ def load_postgis_sql(db_params: dict, sql_files: List[Path], drop_tables_flag: b
         file_size_mb = sql_file.stat().st_size / (1024 * 1024)
         print(f"     (SQL-fil størrelse: {file_size_mb:.1f} MB)")
 
-        cmd = ['psql']
+        cmd = ['psql', '-v', 'ON_ERROR_STOP=1']
         if db_params.get('host'):
             cmd.extend(['-h', db_params['host']])
         if db_params.get('port'):
             cmd.extend(['-p', str(db_params['port'])])
-        cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-f', str(sql_file)])
+        cmd.extend(['-U', db_params['user'], '-d', db_params['database']])
+        cmd.extend(['-c', role_preamble_sql(), '-f', str(sql_file), '-c', role_reset_sql()])
 
         try:
             subprocess.run(cmd, env=env, check=True)
@@ -1599,6 +1721,8 @@ def load_dataset(
                     table_names, schema_prefix = extract_table_names_from_zip_sql(zip_path, files_in_zip[0])
                     if schema_prefix:
                         grant_privileges_for_schema_prefix(db_params, schema_prefix)
+                    else:
+                        grant_privileges_for_schema(db_params, 'public')
                     if table_names:
                         # Analyze imported tables
                         analyze_tables(db_params, tables=table_names)
@@ -1621,6 +1745,7 @@ def load_dataset(
                     if staging_schema:
                         print(f"==> Flytter staging-schema {staging_schema} til public ...")
                         move_schema_objects(db_params, staging_schema, 'public')
+                        grant_privileges_for_schema(db_params, 'public')
                     # Analyze imported table
                     analyze_tables(db_params, tables=[f'public.{table_name}'])
                     return True
@@ -1675,6 +1800,8 @@ def load_dataset(
                 table_names, schema_prefix = extract_table_names_from_sql(files[0])
                 if schema_prefix:
                     grant_privileges_for_schema_prefix(db_params, schema_prefix)
+                else:
+                    grant_privileges_for_schema(db_params, 'public')
                 if table_names:
                     # Analyze imported tables
                     analyze_tables(db_params, tables=table_names)
@@ -1696,6 +1823,7 @@ def load_dataset(
                 if staging_schema:
                     print(f"==> Flytter staging-schema {staging_schema} til public ...")
                     move_schema_objects(db_params, staging_schema, 'public')
+                    grant_privileges_for_schema(db_params, 'public')
                 # Analyze imported table
                 analyze_tables(db_params, tables=[f'public.{table_name}'])
                 return True
@@ -1709,6 +1837,7 @@ def load_dataset(
                 print("==> Flytter staging-schema til public ...")
                 if staging_schema:
                     move_schema_objects(db_params, staging_schema, 'public')
+                    grant_privileges_for_schema(db_params, 'public')
                 print("==> Bygger manglende spatial-indekser ...")
                 create_missing_spatial_indexes(db_params)
                 # Analyze imported tables (analyze public schema after move)

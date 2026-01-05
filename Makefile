@@ -11,7 +11,7 @@ VENV := venv
 PYTHON := $(VENV)/bin/python3
 PIP := $(VENV)/bin/pip
 
-.PHONY: dependencies download-matrikkel create-db ensure-db drop-db load-matrikkel setup-matrikkel reload-matrikkel inspect-matrikkel inspect-wsdl run-api test update-datasets db-status inspect-db run-migrations verify-migration build-links cron-update setup-roles fresh-start
+.PHONY: dependencies download-matrikkel create-db ensure-db drop-db load-matrikkel setup-matrikkel reload-matrikkel inspect-matrikkel inspect-wsdl run-api test update-datasets db-status inspect-db run-migrations verify-migration build-links cron-update setup-roles fresh-start init-db refresh-db
 
 # Install all required system dependencies (Ubuntu/Debian)
 dependencies:
@@ -130,15 +130,22 @@ fresh-start:
 	@echo "  ✓ Roller konfigurert"
 	@echo ""
 	@echo "==> Steg 4: Laster inn data (dette kan ta lang tid)..."
-	@echo "  ⚠ Kjør dette manuelt: PGUSER=stiflyt_updater make update-datasets"
+	@PGUSER=stiflyt_updater $(MAKE) update-datasets
 	@echo ""
 	@echo "==> Steg 5: Kjør migrasjoner..."
-	@echo "  ⚠ Kjør dette manuelt: PGUSER=stiflyt_updater make run-migrations"
+	@PGUSER=stiflyt_updater $(MAKE) run-migrations
 	@echo ""
 	@echo "==> Fresh start fullført!"
-	@echo "  Neste steg:"
-	@echo "    1. PGUSER=stiflyt_updater make update-datasets"
-	@echo "    2. PGUSER=stiflyt_updater make run-migrations"
+	@echo "  ✅ Database er initialisert og oppdatert"
+
+# Initialize everything from zero (drop + recreate + load + migrations)
+init-db: fresh-start
+
+# Refresh data and migrations without dropping database
+refresh-db: $(VENV)
+	@echo "==> Refresh: Oppdaterer data og kjører migrasjoner..."
+	@PGUSER=stiflyt_updater $(MAKE) update-datasets
+	@PGUSER=stiflyt_updater $(MAKE) run-migrations
 
 # Setup database roles and permissions (run once after create-db)
 # Requires superuser privileges - automatically tries as postgres if current user fails

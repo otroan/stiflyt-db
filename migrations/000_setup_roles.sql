@@ -57,6 +57,26 @@ BEGIN
     END;
 END $$;
 
+-- Ensure updater defaults to owner role for consistent object ownership
+DO $$
+BEGIN
+    BEGIN
+        EXECUTE 'ALTER ROLE stiflyt_updater SET ROLE stiflyt_owner';
+    EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
+        RAISE NOTICE 'Could not set default role for stiflyt_updater: %', SQLERRM;
+    END;
+END $$;
+
+-- Revoke default public access
+DO $$
+DECLARE
+    db_name TEXT;
+BEGIN
+    SELECT current_database() INTO db_name;
+    EXECUTE format('REVOKE ALL ON DATABASE %I FROM PUBLIC', db_name);
+END $$;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+
 -- Grant database connection privilege and CREATE privilege for schema creation
 DO $$
 DECLARE
@@ -86,6 +106,8 @@ BEGIN
     EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA public GRANT ALL ON FUNCTIONS TO stiflyt_updater';
     EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA public GRANT SELECT ON TABLES TO stiflyt_reader';
     EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA public GRANT SELECT ON SEQUENCES TO stiflyt_reader';
+    EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA public GRANT SELECT ON TABLES TO stiflyt_reader';
+    EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA public GRANT SELECT ON SEQUENCES TO stiflyt_reader';
 END $$;
 
 -- Grant all privileges on public schema to owner (for CREATE/DROP operations)
@@ -273,6 +295,8 @@ BEGIN
             EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT ALL ON FUNCTIONS TO stiflyt_updater', schema_rec.nspname);
             EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT SELECT ON TABLES TO stiflyt_reader', schema_rec.nspname);
             EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT SELECT ON SEQUENCES TO stiflyt_reader', schema_rec.nspname);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA %I GRANT SELECT ON TABLES TO stiflyt_reader', schema_rec.nspname);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA %I GRANT SELECT ON SEQUENCES TO stiflyt_reader', schema_rec.nspname);
         EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
             RAISE NOTICE 'Could not set default privileges in schema % for stiflyt_owner: %', schema_rec.nspname, SQLERRM;
         END;
@@ -377,6 +401,8 @@ BEGIN
                 EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT ALL ON FUNCTIONS TO stiflyt_updater', schema_name);
                 EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT SELECT ON TABLES TO stiflyt_reader', schema_name);
                 EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT SELECT ON SEQUENCES TO stiflyt_reader', schema_name);
+                EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA %I GRANT SELECT ON TABLES TO stiflyt_reader', schema_name);
+                EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA %I GRANT SELECT ON SEQUENCES TO stiflyt_reader', schema_name);
             END;
             $func$;
         EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
