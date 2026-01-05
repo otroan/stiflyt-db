@@ -4,14 +4,34 @@ DATA_DIR := data/matrikkel
 PGDATABASE ?= matrikkel
 PGHOST ?= localhost
 PGPORT ?= 5432
-PGUSER ?= stiflyt_reader
+PGUSER ?= stiflyt_updater
+PGADMIN_USER ?= postgres
 
 # Virtual environment
 VENV := venv
 PYTHON := $(VENV)/bin/python3
 PIP := $(VENV)/bin/pip
 
-.PHONY: dependencies download-matrikkel create-db ensure-db drop-db load-matrikkel setup-matrikkel reload-matrikkel inspect-matrikkel inspect-wsdl run-api test update-datasets db-status inspect-db run-migrations verify-migration build-links cron-update setup-roles fresh-start init-db refresh-db
+.PHONY: dependencies help create-db ensure-db drop-db load-dataset update-datasets db-status inspect-db run-migrations verify-migration build-links cron-update setup-roles fresh-start init-db refresh-db test
+
+help:
+	@echo "stiflyt-db Makefile"
+	@echo ""
+	@echo "Common targets:"
+	@echo "  make dependencies   Install system deps (Debian/Ubuntu)"
+	@echo "  make create-db      Create database + PostGIS extension"
+	@echo "  make setup-roles    Create roles/privileges (superuser)"
+	@echo "  make update-datasets Download + load datasets from config"
+	@echo "  make run-migrations Run SQL migrations"
+	@echo "  make fresh-start    Drop + recreate + load + migrate"
+	@echo "  make refresh-db     Reload data + migrations without drop"
+	@echo "  make db-status      Health check"
+	@echo "  make inspect-db     Schema overview"
+	@echo "  make test           Run tests"
+	@echo ""
+	@echo "Variables:"
+	@echo "  PGDATABASE=$(PGDATABASE) PGHOST=$(PGHOST) PGPORT=$(PGPORT)"
+	@echo "  PGUSER=$(PGUSER) PGADMIN_USER=$(PGADMIN_USER)"
 
 # Install all required system dependencies (Ubuntu/Debian)
 dependencies:
@@ -83,14 +103,14 @@ create-db:
 	if [ -z "$(PGPASSWORD)" ]; then \
 		echo "  ℹ Bruker peer authentication (local socket)"; \
 	fi; \
-	PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGUSER) -d postgres \
+	PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d postgres \
 		-c "SELECT 1 FROM pg_database WHERE datname = '$(PGDATABASE)'" 2>&1 | grep -q 1 \
 		&& echo "  ⊙ Database '$(PGDATABASE)' eksisterer allerede" \
-		|| (PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGUSER) -d postgres \
+		|| (PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d postgres \
 			-c "CREATE DATABASE $(PGDATABASE);" 2>&1 && echo "  ✓ Database opprettet" || \
 			(echo "  ✗ Kunne ikke opprette database."; \
 			 echo "     For remote connections, sett PGPASSWORD eller bruk:"; \
-			 echo "     PGUSER=postgres PGPASSWORD=password make create-db"; \
+			 echo "     PGADMIN_USER=postgres PGPASSWORD=password make create-db"; \
 			 exit 1)); \
 	if [ "$(PGHOST)" = "localhost" ]; then \
 		PGPASSWORD=$(PGPASSWORD) psql -U $(PGUSER) -d $(PGDATABASE) \
@@ -194,7 +214,7 @@ drop-db:
 	else \
 		PSQL_HOST="-h $(PGHOST)"; PSQL_PORT="-p $(PGPORT)"; \
 	fi; \
-	PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGUSER) -d postgres \
+	PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d postgres \
 		-c "DROP DATABASE IF EXISTS $(PGDATABASE);" 2>&1 && echo "  ✓ Database slettet" || \
 		(echo "  ✗ Kunne ikke slette database"; exit 1)
 
