@@ -61,6 +61,11 @@ dependencies:
 		python3-gdal \
 		> /dev/null 2>&1 || true
 	@echo "  ✓ GDAL installert"
+	@echo "==> Installerer osm2pgsql (for OSM import)..."
+	@sudo apt-get install -y \
+		osm2pgsql \
+		> /dev/null 2>&1 || true
+	@echo "  ✓ osm2pgsql installert"
 	@echo "==> Installerer Python verktøy..."
 	@sudo apt-get install -y \
 		python3 \
@@ -79,6 +84,7 @@ dependencies:
 	@echo "==> Verifiserer installasjoner..."
 	@command -v psql > /dev/null && echo "  ✓ psql funnet" || echo "  ✗ psql ikke funnet"
 	@command -v ogr2ogr > /dev/null && echo "  ✓ ogr2ogr funnet" || echo "  ✗ ogr2ogr ikke funnet"
+	@command -v osm2pgsql > /dev/null && echo "  ✓ osm2pgsql funnet" || echo "  ✗ osm2pgsql ikke funnet"
 	@command -v python3 > /dev/null && echo "  ✓ python3 funnet" || echo "  ✗ python3 ikke funnet"
 	@$(PYTHON) -c "import psycopg2" 2>/dev/null && echo "  ✓ psycopg2 installert" || echo "  ✗ psycopg2 ikke installert"
 	@$(PYTHON) -c "import yaml" 2>/dev/null && echo "  ✓ pyyaml installert" || echo "  ✗ pyyaml ikke installert"

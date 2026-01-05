@@ -15,6 +15,10 @@ Environment variables:
     PGPASSWORD   - PostgreSQL password (if needed)
     PGDATABASE   - Database name (can also be passed as argument)
     TARGET_SRID  - Target SRID for transformation (default: 25833)
+    OSM2PGSQL_ARGS    - Extra osm2pgsql args (e.g. "--hstore --cache 8000")
+    OSM2PGSQL_SCHEMA  - Target schema for osm2pgsql (default: public)
+    OSM2PGSQL_PREFIX  - Table prefix for osm2pgsql (default: planet_osm)
+    OSM2PGSQL_STYLE   - Path to osm2pgsql style file (optional)
 """
 
 import os
@@ -23,6 +27,7 @@ import zipfile
 import subprocess
 import re
 import argparse
+import shlex
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -1082,6 +1087,15 @@ def check_ogr2ogr() -> bool:
         return False
 
 
+def check_osm2pgsql() -> bool:
+    """Check if osm2pgsql is available."""
+    try:
+        subprocess.run(['osm2pgsql', '--version'], capture_output=True, check=True)
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+
+
 def get_fgdb_feature_count(gdb_dir: Path) -> Optional[int]:
     """Get total feature count from FGDB file using ogrinfo.
 
@@ -1674,10 +1688,7 @@ def load_osm_pbf(
     staging_schema: Optional[str],
     drop_tables: bool = False
 ) -> bool:
-    """Load OSM PBF file using ogr2ogr.
-
-    OSM PBF files contain multiple layers (points, lines, multipolygons, etc.)
-    that ogr2ogr will import as separate tables.
+    """Load OSM PBF file using osm2pgsql.
 
     Args:
         db_params: Database connection parameters
@@ -1686,32 +1697,20 @@ def load_osm_pbf(
         staging_schema: Schema name for staging (or None for public)
         drop_tables: If True, drop existing tables before loading
     """
-    if not check_ogr2ogr():
-        print("Feil: ogr2ogr ikke funnet. Installer GDAL:", file=sys.stderr)
-        print("  Ubuntu/Debian: sudo apt-get install gdal-bin", file=sys.stderr)
-        print("  macOS: brew install gdal", file=sys.stderr)
+    if not check_osm2pgsql():
+        print("Feil: osm2pgsql ikke funnet. Installer osm2pgsql:", file=sys.stderr)
+        print("  Ubuntu/Debian: sudo apt-get install osm2pgsql", file=sys.stderr)
+        print("  macOS: brew install osm2pgsql", file=sys.stderr)
         return False
 
     env = os.environ.copy()
     if db_params.get('password'):
         env['PGPASSWORD'] = db_params['password']
 
-    # When host is None, unset PGHOST to ensure Unix socket is used
-    if db_params.get('host') is None:
-        env.pop('PGHOST', None)
-        env.pop('PGPORT', None)
-
-    # Build connection string
-    conn_parts = []
-    if db_params.get('host'):
-        conn_parts.append(f"host={db_params['host']}")
-        if db_params.get('port'):
-            conn_parts.append(f"port={db_params['port']}")
-    conn_parts.append(f"user={db_params['user']}")
-    conn_parts.append(f"dbname={db_params['database']}")
-    if db_params.get('password'):
-        conn_parts.append(f"password={db_params['password']}")
-    conn_str = "PG:" + " ".join(conn_parts)
+    schema = staging_schema or os.environ.get('OSM2PGSQL_SCHEMA', 'public')
+    prefix = os.environ.get('OSM2PGSQL_PREFIX', 'planet_osm')
+    style = os.environ.get('OSM2PGSQL_STYLE')
+    extra_args = shlex.split(os.environ.get('OSM2PGSQL_ARGS', ''))
 
     # Clean up staging schema if it exists (from previous failed/aborted imports)
     if staging_schema:
@@ -1736,40 +1735,34 @@ def load_osm_pbf(
             return False
         print("     ✓ Staging schema opprettet")
 
-    print(f"  -> Laster {osm_file.name} (OSM PBF) ...")
-    print("     OSM PBF filer inneholder flere lag (points, lines, multipolygons, etc.)")
+    print(f"  -> Laster {osm_file.name} (OSM PBF) med osm2pgsql ...")
 
     cmd = [
-        'ogr2ogr',
-        '-f', 'PostgreSQL',
-        conn_str,
-        str(osm_file),
-        '-nlt', 'PROMOTE_TO_MULTI',
-        '-lco', 'GEOMETRY_NAME=geom',
-        '-lco', 'FID=ogc_fid',
-        '-lco', 'SPATIAL_INDEX=NO',  # Deaktiver indekser under import for raskere import
-        '-lco', 'OVERWRITE=YES' if drop_tables else 'OVERWRITE=NO',
-        '-lco', 'UNLOGGED=YES',  # Bruk unlogged tables for raskere import
-        '--config', 'PG_USE_COPY', 'YES',  # hurtigere innlasting
-        '-gt', '500000',  # større batcher til COPY
-        '-progress',
-        '-skipfailures',
-        '-overwrite' if drop_tables else '-append'
+        'osm2pgsql',
+        '--slim',
+        '--schema', schema,
+        '--prefix', prefix,
+        '-d', db_params['database'],
+        '-U', db_params['user']
     ]
 
-    if staging_schema:
-        cmd.extend(['-lco', f"SCHEMA={staging_schema}"])
+    if db_params.get('host'):
+        cmd.extend(['-H', db_params['host']])
+    if db_params.get('port'):
+        cmd.extend(['-P', str(db_params['port'])])
 
-    if target_srid:
-        cmd.extend(['-t_srs', f'EPSG:{target_srid}'])
+    cmd.append('--create')
+    if drop_tables:
+        cmd.append('--drop')
+
+    if style:
+        cmd.extend(['--style', style])
+
+    cmd.extend(extra_args)
+    cmd.append(str(osm_file))
 
     try:
-        result = subprocess.run(
-            cmd,
-            env=env,
-            capture_output=True,
-            text=True
-        )
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
 
         if result.returncode == 0:
             print(f"     ✓ Lastet")
@@ -1872,7 +1865,7 @@ def load_osm_pbf(
             print(f"     ✗ Feil: {result.stderr}", file=sys.stderr)
             return False
     except FileNotFoundError:
-        print("     ✗ ogr2ogr ikke funnet", file=sys.stderr)
+        print("     ✗ osm2pgsql ikke funnet", file=sys.stderr)
         return False
 
 
