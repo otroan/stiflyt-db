@@ -37,7 +37,12 @@ try:
     sys.path.insert(0, str(scripts_dir))
 
     from download_kartverket import download_from_config
-    from load_dataset import load_dataset, extract_table_names_from_zip_sql, detect_format_from_zip
+    from load_dataset import (
+        load_dataset,
+        extract_table_names_from_zip_sql,
+        detect_format_from_zip,
+        check_owner_membership
+    )
     from db_status import check_database_health, get_db_connection_params, connect_db
 except ImportError as e:
     print(f"Feil: Kunne ikke importere nødvendige moduler: {e}", file=sys.stderr)
@@ -613,6 +618,12 @@ def main():
             log(f"  [{name}] Feed URL: will be discovered from catalog (dataset: {dataset_name})", log_file)
         log(f"  [{name}] Format preference: {format_pref}", log_file)
 
+    db_params = get_db_connection_params()
+    db_params['database'] = database
+    if not check_owner_membership(db_params):
+        log("ERROR: Missing stiflyt_owner role or membership - aborting", log_file)
+        sys.exit(1)
+
     # Download datasets
     if not download_datasets(config_path, log_file):
         log("ERROR: Download failed - aborting", log_file)
@@ -867,4 +878,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

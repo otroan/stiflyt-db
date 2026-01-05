@@ -131,7 +131,7 @@ def ensure_postgis_extension(db_params: dict) -> bool:
     if db_params.get('password'):
         env['PGPASSWORD'] = db_params['password']
 
-    cmd = ['psql']
+    cmd = ['psql', '-v', 'ON_ERROR_STOP=1']
     if db_params.get('host'):
         cmd.extend(['-h', db_params['host']])
     if db_params.get('port'):
@@ -230,7 +230,7 @@ def drop_schemas_by_prefix(db_params: dict, schema_prefix: str) -> bool:
         env['PGPASSWORD'] = db_params['password']
 
     # Build psql command
-    cmd = ['psql']
+    cmd = ['psql', '-v', 'ON_ERROR_STOP=1']
     if db_params.get('host'):
         cmd.extend(['-h', db_params['host']])
     if db_params.get('port'):
@@ -301,7 +301,7 @@ def drop_tables(db_params: dict, table_names: List[str]) -> bool:
     if db_params.get('password'):
         env['PGPASSWORD'] = db_params['password']
 
-    cmd = ['psql']
+    cmd = ['psql', '-v', 'ON_ERROR_STOP=1']
     if db_params.get('host'):
         cmd.extend(['-h', db_params['host']])
     if db_params.get('port'):
@@ -337,19 +337,8 @@ def sanitize_identifier(name: str) -> str:
 
 
 def role_preamble_sql() -> str:
-    """Return SQL that attempts to SET ROLE stiflyt_owner if available."""
-    return """
-    DO $$
-    BEGIN
-        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_owner') THEN
-            BEGIN
-                EXECUTE 'SET ROLE stiflyt_owner';
-            EXCEPTION WHEN insufficient_privilege THEN
-                RAISE NOTICE 'Could not SET ROLE stiflyt_owner (not member)';
-            END;
-        END IF;
-    END $$;
-    """
+    """Return SQL that requires SET ROLE stiflyt_owner."""
+    return "SET ROLE stiflyt_owner;\n"
 
 
 def role_reset_sql() -> str:
@@ -357,8 +346,59 @@ def role_reset_sql() -> str:
     return "RESET ROLE;\n"
 
 
+def check_owner_membership(db_params: dict) -> bool:
+    """Verify current_user can SET ROLE stiflyt_owner and role exists."""
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+
+    cmd = ['psql', '-v', 'ON_ERROR_STOP=1', '-t', '-A', '-F', '|']
+    if db_params.get('host'):
+        cmd.extend(['-h', db_params['host']])
+    if db_params.get('port'):
+        cmd.extend(['-p', str(db_params['port'])])
+    cmd.extend(['-U', db_params['user'], '-d', db_params['database']])
+    cmd.extend(['-c', """
+        SELECT
+            current_user,
+            EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_owner') AS owner_exists,
+            pg_has_role(current_user, 'stiflyt_owner', 'member') AS is_member;
+    """])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+    line = result.stdout.strip()
+    if not line:
+        return False
+    parts = line.split('|')
+    if len(parts) != 3:
+        return False
+    current_user, owner_exists, is_member = parts
+    if owner_exists != 't':
+        print("✗ Role stiflyt_owner does not exist", file=sys.stderr)
+        print("  Fix (as superuser):", file=sys.stderr)
+        print("  psql -d <db> -f migrations/000_setup_roles.sql", file=sys.stderr)
+        return False
+    if is_member != 't':
+        print("✗ Current role is not a member of stiflyt_owner", file=sys.stderr)
+        print(f"  current_user: {current_user}", file=sys.stderr)
+        print("  Fix (as superuser):", file=sys.stderr)
+        print(f"  GRANT stiflyt_owner TO {current_user};", file=sys.stderr)
+        return False
+    return True
+
+
 def grant_privileges_for_schema(db_params: dict, schema_name: Optional[str]) -> bool:
-    """Grant privileges for a specific schema using grant_schema_privileges() when available."""
+    """Grant privileges for a specific schema using grant_schema_privileges()."""
     if not schema_name:
         return True
 
@@ -366,29 +406,17 @@ def grant_privileges_for_schema(db_params: dict, schema_name: Optional[str]) -> 
     if db_params.get('password'):
         env['PGPASSWORD'] = db_params['password']
 
-    cmd = ['psql']
+    cmd = ['psql', '-v', 'ON_ERROR_STOP=1']
     if db_params.get('host'):
         cmd.extend(['-h', db_params['host']])
     if db_params.get('port'):
         cmd.extend(['-p', str(db_params['port'])])
     cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q'])
 
+    schema_literal = schema_name.replace("'", "''")
     sql = f"""
     {role_preamble_sql()}
-    DO $$
-    BEGIN
-        IF EXISTS (
-            SELECT 1 FROM pg_proc p
-            JOIN pg_namespace n ON p.pronamespace = n.oid
-            WHERE n.nspname = 'public' AND p.proname = 'grant_schema_privileges'
-        ) THEN
-            BEGIN
-                PERFORM grant_schema_privileges('{schema_name}');
-            EXCEPTION WHEN insufficient_privilege THEN
-                RAISE NOTICE 'Could not grant privileges for schema % (not owner)', '{schema_name}';
-            END;
-        END IF;
-    END $$;
+    SELECT grant_schema_privileges('{schema_literal}');
     {role_reset_sql()}
     """
 
@@ -458,13 +486,13 @@ def ensure_schema_exists(db_params: dict, schema: str) -> bool:
     - stiflyt_updater: Full write access
     - stiflyt_reader: Read-only access
 
-    Uses the grant_schema_privileges() function if it exists (created by migration 000_setup_roles.sql).
+    Uses the grant_schema_privileges() function (created by migration 000_setup_roles.sql).
     """
     env = os.environ.copy()
     if db_params.get('password'):
         env['PGPASSWORD'] = db_params['password']
 
-    cmd = ['psql']
+    cmd = ['psql', '-v', 'ON_ERROR_STOP=1']
     if db_params.get('host'):
         cmd.extend(['-h', db_params['host']])
     if db_params.get('port'):
@@ -475,35 +503,15 @@ def ensure_schema_exists(db_params: dict, schema: str) -> bool:
     # Use the helper function if it exists (from migration 000_setup_roles.sql)
     # Also ensure stiflyt_owner is the owner (required for ogr2ogr)
     sql = f"""
-    DO $$
-    BEGIN
-        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_owner') THEN
-            BEGIN
-                EXECUTE 'SET ROLE stiflyt_owner';
-            EXCEPTION WHEN insufficient_privilege THEN
-                RAISE NOTICE 'Could not SET ROLE stiflyt_owner (not member)';
-            END;
-        END IF;
-    END $$;
-
+    {role_preamble_sql()}
     CREATE SCHEMA IF NOT EXISTS {schema};
 
     -- Ensure stiflyt_owner is the owner (required for ogr2ogr operations)
     ALTER SCHEMA {schema} OWNER TO stiflyt_owner;
 
-    -- Grant privileges using helper function if it exists
-    DO $$
-    BEGIN
-        IF EXISTS (
-            SELECT 1 FROM pg_proc p
-            JOIN pg_namespace n ON p.pronamespace = n.oid
-            WHERE n.nspname = 'public' AND p.proname = 'grant_schema_privileges'
-        ) THEN
-            PERFORM grant_schema_privileges('{schema}');
-        END IF;
-    END $$;
-
-    RESET ROLE;
+    -- Grant privileges using helper function
+    SELECT grant_schema_privileges('{schema}');
+    {role_reset_sql()}
     """
 
     try:
@@ -524,7 +532,7 @@ def ensure_schema_exists(db_params: dict, schema: str) -> bool:
 def grant_privileges_for_schema_prefix(db_params: dict, schema_prefix: Optional[str]) -> bool:
     """Grant privileges for all schemas matching a prefix.
 
-    Uses grant_schema_privileges() when available.
+    Uses grant_schema_privileges_for_prefix() (created by migration 000_setup_roles.sql).
     """
     if not schema_prefix:
         return True
@@ -533,7 +541,7 @@ def grant_privileges_for_schema_prefix(db_params: dict, schema_prefix: Optional[
     if db_params.get('password'):
         env['PGPASSWORD'] = db_params['password']
 
-    cmd = ['psql']
+    cmd = ['psql', '-v', 'ON_ERROR_STOP=1']
     if db_params.get('host'):
         cmd.extend(['-h', db_params['host']])
     if db_params.get('port'):
@@ -542,31 +550,9 @@ def grant_privileges_for_schema_prefix(db_params: dict, schema_prefix: Optional[
 
     prefix_literal = schema_prefix.replace("'", "''")
     sql = f"""
-    DO $$
-    DECLARE
-        s RECORD;
-    BEGIN
-        IF EXISTS (
-            SELECT 1 FROM pg_proc p
-            JOIN pg_namespace n ON p.pronamespace = n.oid
-            WHERE n.nspname = 'public' AND p.proname = 'grant_schema_privileges'
-        ) THEN
-            FOR s IN
-                SELECT nspname
-                FROM pg_namespace
-                WHERE nspname LIKE '{prefix_literal}_%'
-                  AND nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
-                  AND nspname NOT LIKE 'pg_temp_%'
-                  AND nspname NOT LIKE 'pg_toast_temp_%'
-            LOOP
-                BEGIN
-                    PERFORM grant_schema_privileges(s.nspname);
-                EXCEPTION WHEN insufficient_privilege THEN
-                    RAISE NOTICE 'Could not grant privileges for schema % (not owner)', s.nspname;
-                END;
-            END LOOP;
-        END IF;
-    END $$;
+    {role_preamble_sql()}
+    SELECT grant_schema_privileges_for_prefix('{prefix_literal}');
+    {role_reset_sql()}
     """
 
     try:
@@ -1680,6 +1666,9 @@ def load_dataset(
 
     db_params = get_db_connection_params()
     db_params['database'] = database
+
+    if not check_owner_membership(db_params):
+        return False
 
     if target_srid is None:
         target_srid = int(os.environ.get('TARGET_SRID', '25833'))

@@ -69,7 +69,7 @@ def check_links_table_exists(db_params: dict) -> bool:
     if db_params.get('password'):
         env['PGPASSWORD'] = db_params['password']
 
-    cmd = ['psql']
+    cmd = ['psql', '-v', 'ON_ERROR_STOP=1']
     if db_params.get('host'):
         cmd.extend(['-h', db_params['host']])
     if db_params.get('port'):
@@ -314,18 +314,7 @@ def run_migration(db_params: dict, migration_file: Path) -> bool:
     ])
     if migration_file.name != '000_setup_roles.sql':
         cmd.extend([
-            '-c', """
-                DO $$
-                BEGIN
-                    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_owner') THEN
-                        BEGIN
-                            EXECUTE 'SET ROLE stiflyt_owner';
-                        EXCEPTION WHEN insufficient_privilege THEN
-                            RAISE NOTICE 'Could not SET ROLE stiflyt_owner (not member)';
-                        END;
-                    END IF;
-                END $$;
-            """
+            '-c', "SET ROLE stiflyt_owner;"
         ])
     cmd.extend(['-f', str(migration_file)])
     if migration_file.name != '000_setup_roles.sql':
@@ -439,16 +428,20 @@ def check_owner_membership(db_params: dict) -> bool:
             check=True
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
-        # If we can't check, allow migrations to proceed
-        return True
+        return False
 
     line = result.stdout.strip()
     if not line:
-        return True
+        return False
     parts = line.split('|')
     if len(parts) != 3:
-        return True
+        return False
     current_user, owner_exists, is_member = parts
+    if owner_exists != 't':
+        print("✗ Role stiflyt_owner does not exist", file=sys.stderr)
+        print("  Fix (as superuser):", file=sys.stderr)
+        print("  psql -d <db> -f migrations/000_setup_roles.sql", file=sys.stderr)
+        return False
     if owner_exists == 't' and is_member != 't':
         print("✗ Current role is not a member of stiflyt_owner", file=sys.stderr)
         print(f"  current_user: {current_user}", file=sys.stderr)

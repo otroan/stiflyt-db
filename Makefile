@@ -212,7 +212,7 @@ load-dataset: ensure-db $(VENV)
 # Update all datasets from config file (cron-friendly)
 # This downloads updates and reloads data, replacing old tables
 update-datasets: $(VENV)
-	@$(PYTHON) scripts/update_datasets.py $(or $(CONFIG_FILE),datasets.yaml) $(PGDATABASE)
+	@PGUSER=$${PGUSER:-stiflyt_updater} $(PYTHON) scripts/update_datasets.py $(or $(CONFIG_FILE),datasets.yaml) $(PGDATABASE)
 
 # Check database status and health
 db-status: $(VENV)
@@ -230,7 +230,7 @@ inspect-db: $(VENV)
 # Migrations run automatically after update-datasets, but can be run manually
 # Note: build-links runs automatically before migration 003 if needed
 run-migrations: $(VENV)
-	@$(PYTHON) scripts/run_migrations.py $(PGDATABASE)
+	@PGUSER=$${PGUSER:-stiflyt_updater} $(PYTHON) scripts/run_migrations.py $(PGDATABASE)
 
 # Verify that migration indexes were created successfully
 verify-migration: $(VENV)

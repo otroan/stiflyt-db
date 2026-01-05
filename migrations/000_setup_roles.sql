@@ -97,213 +97,12 @@ GRANT USAGE ON SCHEMA public TO stiflyt_owner;
 GRANT USAGE ON SCHEMA public TO stiflyt_updater;
 GRANT USAGE ON SCHEMA public TO stiflyt_reader;
 
--- Ensure default privileges are set for the owner role
-DO $$
-DECLARE
-BEGIN
-    EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA public GRANT ALL ON TABLES TO stiflyt_updater';
-    EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA public GRANT ALL ON SEQUENCES TO stiflyt_updater';
-    EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA public GRANT ALL ON FUNCTIONS TO stiflyt_updater';
-    EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA public GRANT SELECT ON TABLES TO stiflyt_reader';
-    EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA public GRANT SELECT ON SEQUENCES TO stiflyt_reader';
-    EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA public GRANT SELECT ON TABLES TO stiflyt_reader';
-    EXECUTE 'ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA public GRANT SELECT ON SEQUENCES TO stiflyt_reader';
-END $$;
-
 -- Grant all privileges on public schema to owner (for CREATE/DROP operations)
 GRANT ALL PRIVILEGES ON SCHEMA public TO stiflyt_owner;
 GRANT CREATE ON SCHEMA public TO stiflyt_owner;
 GRANT USAGE, CREATE ON SCHEMA public TO stiflyt_updater;
 
--- Grant read-only on public schema to reader
--- First set ownership to stiflyt_owner, then grant privileges
-DO $$
-DECLARE
-    table_rec RECORD;
-    seq_rec RECORD;
-BEGIN
-    -- First, set ownership of all tables to stiflyt_owner (requires superuser or current owner)
-    FOR table_rec IN
-        SELECT tablename
-        FROM pg_tables
-        WHERE schemaname = 'public'
-    LOOP
-        BEGIN
-            EXECUTE format('ALTER TABLE %I.%I OWNER TO stiflyt_owner', 'public', table_rec.tablename);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not set owner for public.% (may require superuser): %', table_rec.tablename, SQLERRM;
-        END;
-    END LOOP;
-
-    -- Set ownership of all sequences to stiflyt_owner
-    FOR seq_rec IN
-        SELECT sequence_name
-        FROM information_schema.sequences
-        WHERE sequence_schema = 'public'
-    LOOP
-        BEGIN
-            EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO stiflyt_owner', 'public', seq_rec.sequence_name);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not set owner for public.% (may require superuser): %', seq_rec.sequence_name, SQLERRM;
-        END;
-    END LOOP;
-
-    -- Now grant SELECT on tables (should work since we own them or have privileges)
-    FOR table_rec IN
-        SELECT tablename
-        FROM pg_tables
-        WHERE schemaname = 'public'
-    LOOP
-        BEGIN
-            EXECUTE format('GRANT SELECT ON TABLE %I.%I TO stiflyt_reader', 'public', table_rec.tablename);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not grant SELECT on public.%: %', table_rec.tablename, SQLERRM;
-        END;
-    END LOOP;
-
-    -- Grant SELECT on sequences
-    FOR seq_rec IN
-        SELECT sequence_name
-        FROM information_schema.sequences
-        WHERE sequence_schema = 'public'
-    LOOP
-        BEGIN
-            EXECUTE format('GRANT SELECT ON SEQUENCE %I.%I TO stiflyt_reader', 'public', seq_rec.sequence_name);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not grant SELECT on public.%: %', seq_rec.sequence_name, SQLERRM;
-        END;
-    END LOOP;
-END $$;
-
--- Default privileges for public schema are handled above for both roles.
-
--- Grant privileges on all existing schemas (including dynamic ones like turogfriluftsruter_*)
--- This handles schemas that already exist
-DO $$
-DECLARE
-    schema_rec RECORD;
-    obj_rec RECORD;
-BEGIN
-    FOR schema_rec IN
-        SELECT nspname
-        FROM pg_namespace
-        WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
-          AND nspname NOT LIKE 'pg_temp_%'
-          AND nspname NOT LIKE 'pg_toast_temp_%'
-    LOOP
-        -- Grant schema usage (skip if we don't have permission)
-        BEGIN
-            EXECUTE format('GRANT USAGE ON SCHEMA %I TO stiflyt_updater', schema_rec.nspname);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not grant USAGE on schema % to stiflyt_updater: %', schema_rec.nspname, SQLERRM;
-        END;
-        BEGIN
-            EXECUTE format('GRANT USAGE ON SCHEMA %I TO stiflyt_reader', schema_rec.nspname);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not grant USAGE on schema % to stiflyt_reader: %', schema_rec.nspname, SQLERRM;
-        END;
-        BEGIN
-            EXECUTE format('ALTER SCHEMA %I OWNER TO stiflyt_owner', schema_rec.nspname);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not set owner for schema %: %', schema_rec.nspname, SQLERRM;
-        END;
-
-        -- Set OWNER on existing tables to stiflyt_owner (so it can DROP/CREATE them)
-        -- Only if we have permission (skip if not owner/superuser)
-        FOR obj_rec IN
-            SELECT tablename FROM pg_tables WHERE schemaname = schema_rec.nspname
-        LOOP
-            BEGIN
-                EXECUTE format('ALTER TABLE %I.%I OWNER TO stiflyt_owner', schema_rec.nspname, obj_rec.tablename);
-            EXCEPTION WHEN insufficient_privilege THEN
-                -- Not owner - skip (will be handled by grant_schema_privileges function)
-                RAISE NOTICE 'Skipping OWNER change for table %.% (not owner)', schema_rec.nspname, obj_rec.tablename;
-            END;
-        END LOOP;
-
-        -- Set OWNER on existing sequences to stiflyt_owner
-        FOR obj_rec IN
-            SELECT sequence_name FROM information_schema.sequences WHERE sequence_schema = schema_rec.nspname
-        LOOP
-            BEGIN
-                EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO stiflyt_owner', schema_rec.nspname, obj_rec.sequence_name);
-            EXCEPTION WHEN insufficient_privilege THEN
-                RAISE NOTICE 'Skipping OWNER change for sequence %.% (not owner)', schema_rec.nspname, obj_rec.sequence_name;
-            END;
-        END LOOP;
-
-        -- Set OWNER on existing views/materialized views to stiflyt_owner
-        FOR obj_rec IN
-            SELECT viewname FROM pg_views WHERE schemaname = schema_rec.nspname
-        LOOP
-            BEGIN
-                EXECUTE format('ALTER VIEW %I.%I OWNER TO stiflyt_owner', schema_rec.nspname, obj_rec.viewname);
-            EXCEPTION WHEN insufficient_privilege THEN
-                RAISE NOTICE 'Skipping OWNER change for view %.% (not owner)', schema_rec.nspname, obj_rec.viewname;
-            END;
-        END LOOP;
-        FOR obj_rec IN
-            SELECT matviewname FROM pg_matviews WHERE schemaname = schema_rec.nspname
-        LOOP
-            BEGIN
-                EXECUTE format('ALTER MATERIALIZED VIEW %I.%I OWNER TO stiflyt_owner', schema_rec.nspname, obj_rec.matviewname);
-            EXCEPTION WHEN insufficient_privilege THEN
-                RAISE NOTICE 'Skipping OWNER change for materialized view %.% (not owner)', schema_rec.nspname, obj_rec.matviewname;
-            END;
-        END LOOP;
-
-        -- Grant all privileges to updater (skip if we don't have permission)
-        BEGIN
-            EXECUTE format('GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I TO stiflyt_updater', schema_rec.nspname);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not grant privileges on tables in schema %: %', schema_rec.nspname, SQLERRM;
-        END;
-        BEGIN
-            EXECUTE format('GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I TO stiflyt_updater', schema_rec.nspname);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not grant privileges on sequences in schema %: %', schema_rec.nspname, SQLERRM;
-        END;
-        BEGIN
-            EXECUTE format('GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I TO stiflyt_updater', schema_rec.nspname);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not grant privileges on functions in schema %: %', schema_rec.nspname, SQLERRM;
-        END;
-
-        -- Grant create privilege for updater (needed to create tables/views/indexes)
-        BEGIN
-            EXECUTE format('GRANT CREATE ON SCHEMA %I TO stiflyt_updater', schema_rec.nspname);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not grant CREATE on schema %: %', schema_rec.nspname, SQLERRM;
-        END;
-
-        -- Grant read-only to reader
-        BEGIN
-            EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO stiflyt_reader', schema_rec.nspname);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not grant SELECT on tables in schema %: %', schema_rec.nspname, SQLERRM;
-        END;
-        BEGIN
-            EXECUTE format('GRANT SELECT ON ALL SEQUENCES IN SCHEMA %I TO stiflyt_reader', schema_rec.nspname);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not grant SELECT on sequences in schema %: %', schema_rec.nspname, SQLERRM;
-        END;
-
-        -- Set default privileges for future objects for owner role
-        BEGIN
-            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT ALL ON TABLES TO stiflyt_updater', schema_rec.nspname);
-            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT ALL ON SEQUENCES TO stiflyt_updater', schema_rec.nspname);
-            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT ALL ON FUNCTIONS TO stiflyt_updater', schema_rec.nspname);
-            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT SELECT ON TABLES TO stiflyt_reader', schema_rec.nspname);
-            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT SELECT ON SEQUENCES TO stiflyt_reader', schema_rec.nspname);
-            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA %I GRANT SELECT ON TABLES TO stiflyt_reader', schema_rec.nspname);
-            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA %I GRANT SELECT ON SEQUENCES TO stiflyt_reader', schema_rec.nspname);
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            RAISE NOTICE 'Could not set default privileges in schema % for stiflyt_owner: %', schema_rec.nspname, SQLERRM;
-        END;
-
-        RAISE NOTICE 'Granted privileges on schema: %', schema_rec.nspname;
-    END LOOP;
-END $$;
+-- Schema privileges and default privileges are applied via grant_schema_privileges() below.
 
 -- Create a function to grant privileges on new schemas (for future use)
 -- This can be called manually when new schemas are created
@@ -317,100 +116,124 @@ BEGIN
         JOIN pg_namespace n ON p.pronamespace = n.oid
         WHERE n.nspname = 'public' AND p.proname = 'grant_schema_privileges'
     ) THEN
-        -- Function doesn't exist, try to create it
+        CREATE FUNCTION grant_schema_privileges(schema_name TEXT)
+        RETURNS void
+        LANGUAGE plpgsql
+        SECURITY DEFINER
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            obj_rec RECORD;
         BEGIN
-            CREATE FUNCTION grant_schema_privileges(schema_name TEXT)
-            RETURNS void
-            LANGUAGE plpgsql
-            SECURITY DEFINER
-            SET search_path = pg_catalog
-            AS $func$
-            DECLARE
-                obj_rec RECORD;
-            BEGIN
-                -- Grant schema usage
-                EXECUTE format('GRANT USAGE ON SCHEMA %I TO stiflyt_updater', schema_name);
-                EXECUTE format('GRANT USAGE ON SCHEMA %I TO stiflyt_reader', schema_name);
-                EXECUTE format('ALTER SCHEMA %I OWNER TO stiflyt_owner', schema_name);
+            -- Grant schema usage
+            EXECUTE format('GRANT USAGE ON SCHEMA %I TO stiflyt_updater', schema_name);
+            EXECUTE format('GRANT USAGE ON SCHEMA %I TO stiflyt_reader', schema_name);
+            EXECUTE format('ALTER SCHEMA %I OWNER TO stiflyt_owner', schema_name);
 
-                -- Set OWNER on all existing tables to stiflyt_owner (so it can DROP/CREATE them)
-                FOR obj_rec IN
-                    SELECT tablename
-                    FROM pg_tables
-                    WHERE schemaname = schema_name
-                LOOP
-                    BEGIN
-                        EXECUTE format('ALTER TABLE %I.%I OWNER TO stiflyt_owner', schema_name, obj_rec.tablename);
-                    EXCEPTION WHEN insufficient_privilege THEN
-                        RAISE NOTICE 'Skipping OWNER change for table %.% (not owner)', schema_name, obj_rec.tablename;
-                    END;
-                END LOOP;
+            -- Set OWNER on all existing tables to stiflyt_owner (so it can DROP/CREATE them)
+            FOR obj_rec IN
+                SELECT tablename
+                FROM pg_tables
+                WHERE schemaname = schema_name
+            LOOP
+                BEGIN
+                    EXECUTE format('ALTER TABLE %I.%I OWNER TO stiflyt_owner', schema_name, obj_rec.tablename);
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'Skipping OWNER change for table %.% (not owner)', schema_name, obj_rec.tablename;
+                END;
+            END LOOP;
 
-                -- Set OWNER on all existing sequences to stiflyt_owner
-                FOR obj_rec IN
-                    SELECT sequence_name
-                    FROM information_schema.sequences
-                    WHERE sequence_schema = schema_name
-                LOOP
-                    BEGIN
-                        EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO stiflyt_owner', schema_name, obj_rec.sequence_name);
-                    EXCEPTION WHEN insufficient_privilege THEN
-                        RAISE NOTICE 'Skipping OWNER change for sequence %.% (not owner)', schema_name, obj_rec.sequence_name;
-                    END;
-                END LOOP;
+            -- Set OWNER on all existing sequences to stiflyt_owner
+            FOR obj_rec IN
+                SELECT sequence_name
+                FROM information_schema.sequences
+                WHERE sequence_schema = schema_name
+            LOOP
+                BEGIN
+                    EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO stiflyt_owner', schema_name, obj_rec.sequence_name);
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'Skipping OWNER change for sequence %.% (not owner)', schema_name, obj_rec.sequence_name;
+                END;
+            END LOOP;
 
-                -- Set OWNER on all existing views/materialized views to stiflyt_owner
-                FOR obj_rec IN
-                    SELECT viewname
-                    FROM pg_views
-                    WHERE schemaname = schema_name
-                LOOP
-                    BEGIN
-                        EXECUTE format('ALTER VIEW %I.%I OWNER TO stiflyt_owner', schema_name, obj_rec.viewname);
-                    EXCEPTION WHEN insufficient_privilege THEN
-                        RAISE NOTICE 'Skipping OWNER change for view %.% (not owner)', schema_name, obj_rec.viewname;
-                    END;
-                END LOOP;
-                FOR obj_rec IN
-                    SELECT matviewname
-                    FROM pg_matviews
-                    WHERE schemaname = schema_name
-                LOOP
-                    BEGIN
-                        EXECUTE format('ALTER MATERIALIZED VIEW %I.%I OWNER TO stiflyt_owner', schema_name, obj_rec.matviewname);
-                    EXCEPTION WHEN insufficient_privilege THEN
-                        RAISE NOTICE 'Skipping OWNER change for materialized view %.% (not owner)', schema_name, obj_rec.matviewname;
-                    END;
-                END LOOP;
+            -- Set OWNER on all existing views/materialized views to stiflyt_owner
+            FOR obj_rec IN
+                SELECT viewname
+                FROM pg_views
+                WHERE schemaname = schema_name
+            LOOP
+                BEGIN
+                    EXECUTE format('ALTER VIEW %I.%I OWNER TO stiflyt_owner', schema_name, obj_rec.viewname);
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'Skipping OWNER change for view %.% (not owner)', schema_name, obj_rec.viewname;
+                END;
+            END LOOP;
+            FOR obj_rec IN
+                SELECT matviewname
+                FROM pg_matviews
+                WHERE schemaname = schema_name
+            LOOP
+                BEGIN
+                    EXECUTE format('ALTER MATERIALIZED VIEW %I.%I OWNER TO stiflyt_owner', schema_name, obj_rec.matviewname);
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'Skipping OWNER change for materialized view %.% (not owner)', schema_name, obj_rec.matviewname;
+                END;
+            END LOOP;
 
-                -- Grant all privileges to updater
-                EXECUTE format('GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I TO stiflyt_updater', schema_name);
-                EXECUTE format('GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I TO stiflyt_updater', schema_name);
-                EXECUTE format('GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I TO stiflyt_updater', schema_name);
+            -- Grant all privileges to updater
+            EXECUTE format('GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I TO stiflyt_updater', schema_name);
+            EXECUTE format('GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I TO stiflyt_updater', schema_name);
+            EXECUTE format('GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I TO stiflyt_updater', schema_name);
 
-                -- Grant create privilege for updater
-                EXECUTE format('GRANT CREATE ON SCHEMA %I TO stiflyt_updater', schema_name);
+            -- Grant create privilege for updater
+            EXECUTE format('GRANT CREATE ON SCHEMA %I TO stiflyt_updater', schema_name);
 
-                -- Grant read-only to reader
-                EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO stiflyt_reader', schema_name);
-                EXECUTE format('GRANT SELECT ON ALL SEQUENCES IN SCHEMA %I TO stiflyt_reader', schema_name);
+            -- Grant read-only to reader
+            EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO stiflyt_reader', schema_name);
+            EXECUTE format('GRANT SELECT ON ALL SEQUENCES IN SCHEMA %I TO stiflyt_reader', schema_name);
 
-                -- Set default privileges for future objects for owner role
-                EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT ALL ON TABLES TO stiflyt_updater', schema_name);
-                EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT ALL ON SEQUENCES TO stiflyt_updater', schema_name);
-                EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT ALL ON FUNCTIONS TO stiflyt_updater', schema_name);
-                EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT SELECT ON TABLES TO stiflyt_reader', schema_name);
-                EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT SELECT ON SEQUENCES TO stiflyt_reader', schema_name);
-                EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA %I GRANT SELECT ON TABLES TO stiflyt_reader', schema_name);
-                EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA %I GRANT SELECT ON SEQUENCES TO stiflyt_reader', schema_name);
-            END;
-            $func$;
-        EXCEPTION WHEN insufficient_privilege OR OTHERS THEN
-            -- If creation fails (e.g., function exists with different owner), that's OK
-            RAISE NOTICE 'Could not create grant_schema_privileges function (may already exist): %', SQLERRM;
+            -- Set default privileges for future objects for owner role
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT ALL ON TABLES TO stiflyt_updater', schema_name);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT ALL ON SEQUENCES TO stiflyt_updater', schema_name);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT ALL ON FUNCTIONS TO stiflyt_updater', schema_name);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT SELECT ON TABLES TO stiflyt_reader', schema_name);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_owner IN SCHEMA %I GRANT SELECT ON SEQUENCES TO stiflyt_reader', schema_name);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA %I GRANT SELECT ON TABLES TO stiflyt_reader', schema_name);
+            EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE stiflyt_updater IN SCHEMA %I GRANT SELECT ON SEQUENCES TO stiflyt_reader', schema_name);
         END;
+        $func$;
     ELSE
         RAISE NOTICE 'Function grant_schema_privileges already exists, skipping creation';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_proc p
+        JOIN pg_namespace n ON p.pronamespace = n.oid
+        WHERE n.nspname = 'public' AND p.proname = 'grant_schema_privileges_for_prefix'
+    ) THEN
+        CREATE FUNCTION grant_schema_privileges_for_prefix(schema_prefix TEXT)
+        RETURNS void
+        LANGUAGE plpgsql
+        SECURITY DEFINER
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            schema_rec RECORD;
+        BEGIN
+            FOR schema_rec IN
+                SELECT nspname
+                FROM pg_namespace
+                WHERE nspname LIKE schema_prefix || '_%'
+                  AND nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
+                  AND nspname NOT LIKE 'pg_temp_%'
+                  AND nspname NOT LIKE 'pg_toast_temp_%'
+            LOOP
+                PERFORM grant_schema_privileges(schema_rec.nspname);
+            END LOOP;
+        END;
+        $func$;
+    ELSE
+        RAISE NOTICE 'Function grant_schema_privileges_for_prefix already exists, skipping creation';
     END IF;
 END $$;
 
@@ -420,9 +243,28 @@ DO $$
 BEGIN
     GRANT EXECUTE ON FUNCTION grant_schema_privileges(TEXT) TO stiflyt_updater;
     GRANT EXECUTE ON FUNCTION grant_schema_privileges(TEXT) TO PUBLIC;
+    GRANT EXECUTE ON FUNCTION grant_schema_privileges_for_prefix(TEXT) TO stiflyt_updater;
+    GRANT EXECUTE ON FUNCTION grant_schema_privileges_for_prefix(TEXT) TO PUBLIC;
 EXCEPTION WHEN insufficient_privilege THEN
     -- If we're not the owner, skip (function will be created by superuser anyway)
     RAISE NOTICE 'Skipping GRANT on grant_schema_privileges function (not owner)';
+END $$;
+
+-- Apply privileges to public schema and all existing schemas
+DO $$
+DECLARE
+    schema_rec RECORD;
+BEGIN
+    PERFORM grant_schema_privileges('public');
+    FOR schema_rec IN
+        SELECT nspname
+        FROM pg_namespace
+        WHERE nspname NOT IN ('public', 'pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
+          AND nspname NOT LIKE 'pg_temp_%'
+          AND nspname NOT LIKE 'pg_toast_temp_%'
+    LOOP
+        PERFORM grant_schema_privileges(schema_rec.nspname);
+    END LOOP;
 END $$;
 
 -- Final summary
@@ -445,4 +287,5 @@ BEGIN
     RAISE NOTICE '';
     RAISE NOTICE 'Note: If you create new schemas manually, run:';
     RAISE NOTICE '     SELECT grant_schema_privileges(''schema_name'');';
+    RAISE NOTICE '     SELECT grant_schema_privileges_for_prefix(''schema_prefix'');';
 END $$;
