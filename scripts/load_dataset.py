@@ -464,17 +464,37 @@ def run_psql_stream(
     try:
         if pre_sql:
             process.stdin.write(pre_sql.encode('utf-8'))
+            process.stdin.flush()
         while True:
             chunk = stream.read(1024 * 1024)
             if not chunk:
                 break
             process.stdin.write(chunk)
+            process.stdin.flush()
         if post_sql:
             process.stdin.write(post_sql.encode('utf-8'))
+            process.stdin.flush()
         process.stdin.close()
-    except Exception:
+    except (BrokenPipeError, OSError) as e:
+        # Process may have terminated early
         process.kill()
-        raise
+        stdout, stderr = process.communicate()
+        raise subprocess.CalledProcessError(
+            process.returncode if process.returncode else 1,
+            cmd,
+            output=stdout,
+            stderr=stderr or (str(e).encode() if isinstance(e, Exception) else b'')
+        )
+    except Exception as e:
+        process.kill()
+        stdout, stderr = process.communicate()
+        error_msg = f"Error streaming to psql: {e}"
+        raise subprocess.CalledProcessError(
+            process.returncode if process.returncode else 1,
+            cmd,
+            output=stdout,
+            stderr=stderr or error_msg.encode() if stderr else error_msg.encode()
+        )
 
     stdout, stderr = process.communicate()
     return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
@@ -1024,11 +1044,14 @@ def load_postgis_sql(db_params: dict, sql_files: List[Path], drop_tables_flag: b
         cmd.extend(['-c', role_preamble_sql(), '-f', str(sql_file), '-c', role_reset_sql()])
 
         try:
-            subprocess.run(cmd, env=env, check=True)
+            result = subprocess.run(cmd, env=env, check=True, capture_output=True, text=True)
             success_count += 1
             print(f"     ✓ Lastet")
         except subprocess.CalledProcessError as e:
-            print(f"     ✗ Feil ved lasting: {e}", file=sys.stderr)
+            error_msg = e.stderr if e.stderr else str(e)
+            if e.stdout:
+                error_msg = f"{error_msg}\nSTDOUT: {e.stdout}"
+            print(f"     ✗ Feil ved lasting: {error_msg}", file=sys.stderr)
             return False
 
     return success_count > 0

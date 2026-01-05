@@ -842,8 +842,7 @@ def main():
     # Post-update health check
     log("==> Verifying database health...", log_file)
     try:
-        from db_status import get_db_connection_params as get_status_db_params
-        db_params = get_status_db_params()
+        db_params = get_db_connection_params()
         db_params['database'] = database
 
         is_healthy, status = check_database_health(db_params, min_tables=len(configs))
