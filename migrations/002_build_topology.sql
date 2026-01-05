@@ -18,6 +18,7 @@ DECLARE
     segment_count BIGINT;
     node_count BIGINT;
     anchor_count BIGINT;
+    ruteinfopunkt_exists BOOLEAN;
     start_time TIMESTAMP;
     step_time TIMESTAMP;
 BEGIN
@@ -88,6 +89,13 @@ BEGIN
         RAISE NOTICE 'Table %.% already exists, skipping creation', schema_name, nodes_table;
     END;
 
+    -- Best-effort cleanup if table existed and could not be dropped
+    BEGIN
+        EXECUTE format('TRUNCATE TABLE %I.%I', schema_name, nodes_table);
+    EXCEPTION WHEN insufficient_privilege OR undefined_table THEN
+        RAISE NOTICE 'Could not truncate %.% (not owner or missing), proceeding with conflict-safe insert', schema_name, nodes_table;
+    END;
+
     RAISE NOTICE '  ✓ Created table: %.%', schema_name, nodes_table;
     RAISE NOTICE '  Time: %', clock_timestamp() - step_time;
 
@@ -119,7 +127,8 @@ BEGIN
                 WHERE %I IS NOT NULL
             ) AS all_endpoints
         ) AS endpoints_with_hash
-        ORDER BY geom_hash;
+        ORDER BY geom_hash
+        ON CONFLICT (geom_hash) DO NOTHING;
     ', schema_name, nodes_table,
        geom_column_quoted, schema_name, segments_table, geom_column_quoted,
        geom_column_quoted, schema_name, segments_table, geom_column_quoted);
@@ -248,17 +257,26 @@ BEGIN
 
     -- Step 8.5: Create index on ruteinfopunkt.posisjon BEFORE spatial join (critical for performance)
     -- This index is essential for the ST_DWithin join in Step 9
-    step_time := clock_timestamp();
-    RAISE NOTICE '';
-    RAISE NOTICE 'Step 8.5: Creating index on ruteinfopunkt.posisjon...';
-    RAISE NOTICE '  This index is critical for the spatial join in Step 9';
-    EXECUTE format('
-        CREATE INDEX IF NOT EXISTS idx_ruteinfopunkt_posisjon_gist
-        ON %I.ruteinfopunkt USING GIST (posisjon)
-        WHERE posisjon IS NOT NULL;
-    ', schema_name);
-    RAISE NOTICE '  ✓ Created GIST index on ruteinfopunkt.posisjon';
-    RAISE NOTICE '  Time: %', clock_timestamp() - step_time;
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = schema_name AND table_name = 'ruteinfopunkt'
+    ) INTO ruteinfopunkt_exists;
+
+    IF ruteinfopunkt_exists THEN
+        step_time := clock_timestamp();
+        RAISE NOTICE '';
+        RAISE NOTICE 'Step 8.5: Creating index on ruteinfopunkt.posisjon...';
+        RAISE NOTICE '  This index is critical for the spatial join in Step 9';
+        EXECUTE format('
+            CREATE INDEX IF NOT EXISTS idx_ruteinfopunkt_posisjon_gist
+            ON %I.ruteinfopunkt USING GIST (posisjon)
+            WHERE posisjon IS NOT NULL;
+        ', schema_name);
+        RAISE NOTICE '  ✓ Created GIST index on ruteinfopunkt.posisjon';
+        RAISE NOTICE '  Time: %', clock_timestamp() - step_time;
+    ELSE
+        RAISE NOTICE 'ruteinfopunkt not found in %. Skipping spatial index and ruteinfopunkt anchors.', schema_name;
+    END IF;
 
     -- Step 9: Create materialized view for anchor nodes
     -- Anchor nodes are:
@@ -271,12 +289,62 @@ BEGIN
     RAISE NOTICE 'Step 9: Creating materialized view for anchor nodes...';
     RAISE NOTICE '  This step includes a spatial join and may take 1-5 minutes...';
     RAISE NOTICE '  Getting topology anchors (degree != 2)...';
-    EXECUTE format('
-        DROP MATERIALIZED VIEW IF EXISTS %I.anchor_nodes CASCADE;
+    IF ruteinfopunkt_exists THEN
+        EXECUTE format('
+            DROP MATERIALIZED VIEW IF EXISTS %I.anchor_nodes CASCADE;
 
-        CREATE MATERIALIZED VIEW %I.anchor_nodes AS
-        WITH topology_anchors AS (
-            -- Fast: Get all nodes with degree != 2 (topology-based anchors)
+            CREATE MATERIALIZED VIEW %I.anchor_nodes AS
+            WITH topology_anchors AS (
+                -- Fast: Get all nodes with degree != 2 (topology-based anchors)
+                SELECT
+                    node_id,
+                    geom,
+                    degree,
+                    ''topology'' as anchor_type,
+                    NULL::bigint as ruteinfopunkt_objid,
+                    NULL::double precision as ruteinfopunkt_distance_m
+                FROM %I.node_degree
+                WHERE degree != 2
+            ),
+            ruteinfopunkt_matches AS (
+                -- Optimized spatial join: Only check nodes with degree=2 that are not already anchors
+                -- Use spatial index on both sides for fast lookup
+                SELECT DISTINCT ON (n.node_id)
+                    n.node_id,
+                    n.geom,
+                    n.degree,
+                    rp.objid as ruteinfopunkt_objid,
+                    ST_Distance(n.geom, rp.posisjon) as distance_m
+                FROM %I.node_degree n
+                JOIN %I.ruteinfopunkt rp ON ST_DWithin(n.geom, rp.posisjon, 100)
+                WHERE n.degree = 2  -- Only check degree=2 nodes (topology anchors already handled)
+                  AND rp.posisjon IS NOT NULL
+                ORDER BY n.node_id, ST_Distance(n.geom, rp.posisjon)
+            )
+            -- Combine topology anchors and ruteinfopunkt matches
+            SELECT
+                node_id,
+                geom,
+                degree,
+                anchor_type,
+                ruteinfopunkt_objid,
+                ruteinfopunkt_distance_m
+            FROM topology_anchors
+            UNION ALL
+            SELECT
+                node_id,
+                geom,
+                degree,
+                ''ruteinfopunkt'' as anchor_type,
+                ruteinfopunkt_objid,
+                distance_m as ruteinfopunkt_distance_m
+            FROM ruteinfopunkt_matches;
+        ', schema_name, schema_name, schema_name, schema_name, schema_name);
+    ELSE
+        EXECUTE format('
+            DROP MATERIALIZED VIEW IF EXISTS %I.anchor_nodes CASCADE;
+
+            CREATE MATERIALIZED VIEW %I.anchor_nodes AS
             SELECT
                 node_id,
                 geom,
@@ -285,42 +353,9 @@ BEGIN
                 NULL::bigint as ruteinfopunkt_objid,
                 NULL::double precision as ruteinfopunkt_distance_m
             FROM %I.node_degree
-            WHERE degree != 2
-        ),
-        ruteinfopunkt_matches AS (
-            -- Optimized spatial join: Only check nodes with degree=2 that are not already anchors
-            -- Use spatial index on both sides for fast lookup
-            SELECT DISTINCT ON (n.node_id)
-                n.node_id,
-                n.geom,
-                n.degree,
-                rp.objid as ruteinfopunkt_objid,
-                ST_Distance(n.geom, rp.posisjon) as distance_m
-            FROM %I.node_degree n
-            JOIN %I.ruteinfopunkt rp ON ST_DWithin(n.geom, rp.posisjon, 100)
-            WHERE n.degree = 2  -- Only check degree=2 nodes (topology anchors already handled)
-              AND rp.posisjon IS NOT NULL
-            ORDER BY n.node_id, ST_Distance(n.geom, rp.posisjon)
-        )
-        -- Combine topology anchors and ruteinfopunkt matches
-        SELECT
-            node_id,
-            geom,
-            degree,
-            anchor_type,
-            ruteinfopunkt_objid,
-            ruteinfopunkt_distance_m
-        FROM topology_anchors
-        UNION ALL
-        SELECT
-            node_id,
-            geom,
-            degree,
-            ''ruteinfopunkt'' as anchor_type,
-            ruteinfopunkt_objid,
-            distance_m as ruteinfopunkt_distance_m
-        FROM ruteinfopunkt_matches;
-    ', schema_name, schema_name, schema_name, schema_name, schema_name);
+            WHERE degree != 2;
+        ', schema_name, schema_name, schema_name);
+    END IF;
     EXECUTE format('SELECT COUNT(*) FROM %I.anchor_nodes', schema_name) INTO anchor_count;
     RAISE NOTICE '  ✓ Created materialized view: anchor_nodes';
     RAISE NOTICE '  Found % anchor nodes', anchor_count;
@@ -361,8 +396,10 @@ BEGIN
     RAISE NOTICE '  ✓ Analyzed node_degree';
     EXECUTE format('ANALYZE %I.anchor_nodes', schema_name);
     RAISE NOTICE '  ✓ Analyzed anchor_nodes';
-    EXECUTE format('ANALYZE %I.ruteinfopunkt', schema_name);
-    RAISE NOTICE '  ✓ Analyzed ruteinfopunkt';
+    IF ruteinfopunkt_exists THEN
+        EXECUTE format('ANALYZE %I.ruteinfopunkt', schema_name);
+        RAISE NOTICE '  ✓ Analyzed ruteinfopunkt';
+    END IF;
     RAISE NOTICE '  Time: %', clock_timestamp() - step_time;
 
     -- Summary

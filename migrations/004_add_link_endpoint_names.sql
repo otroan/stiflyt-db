@@ -130,7 +130,7 @@ BEGIN
                     JOIN %I.skrivemate sm ON sn.objid = sm.stedsnavn_fk
                     JOIN %I.sted_posisjon sp ON sn.sted_fk = sp.stedsnummer
                     WHERE nrp.node_id IS NULL  -- Only if no ruteinfopunkt match
-                      AND ST_DWithin(n.geom, sp.geom, 500)
+                      AND ST_DWithin(n.geom, sp.geom, 200)
                       AND sm.komplettskrivemate IS NOT NULL
                       AND sp.geom IS NOT NULL
                     ORDER BY n.id, ST_Distance(n.geom, sp.geom)
