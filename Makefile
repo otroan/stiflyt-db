@@ -160,14 +160,52 @@ fresh-start:
 	@read -p "  Er du sikker? (skriv 'yes' for å bekrefte): " confirm && [ "$$confirm" = "yes" ] || exit 1
 	@echo ""
 	@echo "==> Steg 1: Sletter eksisterende database..."
-	@sudo -u postgres psql -c "DROP DATABASE IF EXISTS $(PGDATABASE);" 2>&1 && echo "  ✓ Database slettet" || echo "  ⊙ Database eksisterte ikke"
+	@if [ "$(PGHOST)" = "localhost" ]; then \
+		PSQL_HOST="" PSQL_PORT=""; \
+	else \
+		PSQL_HOST="-h $(PGHOST)"; PSQL_PORT="-p $(PGPORT)"; \
+	fi; \
+	if command -v sudo > /dev/null 2>&1 && id postgres > /dev/null 2>&1; then \
+		sudo -u postgres psql $$PSQL_HOST $$PSQL_PORT -c "DROP DATABASE IF EXISTS $(PGDATABASE);" 2>&1 && echo "  ✓ Database slettet" || echo "  ⊙ Database eksisterte ikke"; \
+	elif [ "$(PGHOST)" = "localhost" ]; then \
+		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d postgres -c "DROP DATABASE IF EXISTS $(PGDATABASE);" 2>&1 && echo "  ✓ Database slettet" || \
+		(PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -d postgres -c "DROP DATABASE IF EXISTS $(PGDATABASE);" 2>&1 && echo "  ✓ Database slettet" || echo "  ⊙ Database eksisterte ikke"); \
+	else \
+		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d postgres -c "DROP DATABASE IF EXISTS $(PGDATABASE);" 2>&1 && echo "  ✓ Database slettet" || echo "  ⊙ Database eksisterte ikke"; \
+	fi
 	@echo ""
 	@echo "==> Steg 2: Oppretter ny database..."
-	@sudo -u postgres psql -c "CREATE DATABASE $(PGDATABASE);" 2>&1 && echo "  ✓ Database opprettet" || (echo "  ✗ Kunne ikke opprette database"; exit 1)
-	@sudo -u postgres psql -d $(PGDATABASE) -c "CREATE EXTENSION IF NOT EXISTS postgis;" 2>&1 > /dev/null && echo "  ✓ PostGIS extension aktivert" || (echo "  ✗ Kunne ikke aktivere PostGIS"; exit 1)
+	@if [ "$(PGHOST)" = "localhost" ]; then \
+		PSQL_HOST="" PSQL_PORT=""; \
+	else \
+		PSQL_HOST="-h $(PGHOST)"; PSQL_PORT="-p $(PGPORT)"; \
+	fi; \
+	if command -v sudo > /dev/null 2>&1 && id postgres > /dev/null 2>&1; then \
+		sudo -u postgres psql $$PSQL_HOST $$PSQL_PORT -c "CREATE DATABASE $(PGDATABASE);" 2>&1 && echo "  ✓ Database opprettet" || (echo "  ✗ Kunne ikke opprette database"; exit 1); \
+		sudo -u postgres psql $$PSQL_HOST $$PSQL_PORT -d $(PGDATABASE) -c "CREATE EXTENSION IF NOT EXISTS postgis;" 2>&1 > /dev/null && echo "  ✓ PostGIS extension aktivert" || (echo "  ✗ Kunne ikke aktivere PostGIS"; exit 1); \
+	elif [ "$(PGHOST)" = "localhost" ]; then \
+		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d postgres -c "CREATE DATABASE $(PGDATABASE);" 2>&1 && echo "  ✓ Database opprettet" || \
+		(PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -d postgres -c "CREATE DATABASE $(PGDATABASE);" 2>&1 && echo "  ✓ Database opprettet" || (echo "  ✗ Kunne ikke opprette database"; exit 1)); \
+		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d $(PGDATABASE) -c "CREATE EXTENSION IF NOT EXISTS postgis;" 2>&1 > /dev/null && echo "  ✓ PostGIS extension aktivert" || \
+		(PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -d $(PGDATABASE) -c "CREATE EXTENSION IF NOT EXISTS postgis;" 2>&1 > /dev/null && echo "  ✓ PostGIS extension aktivert" || (echo "  ✗ Kunne ikke aktivere PostGIS"; exit 1)); \
+	else \
+		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d postgres -c "CREATE DATABASE $(PGDATABASE);" 2>&1 && echo "  ✓ Database opprettet" || (echo "  ✗ Kunne ikke opprette database"; exit 1); \
+		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d $(PGDATABASE) -c "CREATE EXTENSION IF NOT EXISTS postgis;" 2>&1 > /dev/null && echo "  ✓ PostGIS extension aktivert" || (echo "  ✗ Kunne ikke aktivere PostGIS"; exit 1); \
+	fi
 	@echo ""
 	@echo "==> Steg 3: Setter opp roller og privilegier..."
-	@sudo -u postgres psql -d $(PGDATABASE) -f migrations/000_setup_roles.sql 2>&1 | grep -v "^WARNING:" | grep -v "^NOTICE:" || true
+	@if [ "$(PGHOST)" = "localhost" ]; then \
+		PSQL_HOST="" PSQL_PORT=""; \
+		if command -v sudo > /dev/null 2>&1 && id postgres > /dev/null 2>&1; then \
+			sudo -u postgres psql $$PSQL_HOST $$PSQL_PORT -d $(PGDATABASE) -f migrations/000_setup_roles.sql 2>&1 | grep -v "^WARNING:" | grep -v "^NOTICE:" || true; \
+		else \
+			PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d $(PGDATABASE) -f migrations/000_setup_roles.sql 2>&1 | grep -v "^WARNING:" | grep -v "^NOTICE:" || \
+			(PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -d $(PGDATABASE) -f migrations/000_setup_roles.sql 2>&1 | grep -v "^WARNING:" | grep -v "^NOTICE:" || true); \
+		fi; \
+	else \
+		PSQL_HOST="-h $(PGHOST)"; PSQL_PORT="-p $(PGPORT)"; \
+		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d $(PGDATABASE) -f migrations/000_setup_roles.sql 2>&1 | grep -v "^WARNING:" | grep -v "^NOTICE:" || true; \
+	fi
 	@echo "  ✓ Roller konfigurert"
 	@echo ""
 	@echo "==> Steg 4: Laster inn data (dette kan ta lang tid)..."
