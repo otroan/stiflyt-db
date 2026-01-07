@@ -69,6 +69,7 @@ BEGIN
     IF dynamic_schema IS NOT NULL THEN
         -- List of tables to create stable views for
         -- These are the main tables the backend needs to access
+        -- Also includes materialized views (routes)
         FOR tbl_name IN
             SELECT unnest(ARRAY[
                 'fotrute',
@@ -77,7 +78,8 @@ BEGIN
                 'links',
                 'link_segments',
                 'nodes',
-                'anchor_nodes'
+                'anchor_nodes',
+                'routes'
             ])
         LOOP
             -- Check if table or materialized view exists in dynamic schema
@@ -133,7 +135,8 @@ BEGIN
         FOR tbl_name IN
             SELECT unnest(ARRAY[
                 'link_ruteinfo',
-                'links_with_routes'
+                'links_with_routes',
+                'route_segments'
             ])
         LOOP
             -- Check if view exists in dynamic schema
