@@ -170,6 +170,13 @@ BEGIN
                 FROM %I.nodes n
                 JOIN %I.ruteinfopunkt rp ON ST_DWithin(n.geom, rp.posisjon, 100)
                 WHERE rp.posisjon IS NOT NULL
+                  AND rp.tilrettelegging IN (
+                      ''12'', -- Hytte
+                      ''42'', -- Hytte betjent
+                      ''43'', -- Hytte selvbetjent
+                      ''44'', -- Hytte ubetjent
+                      ''22''  -- Parkeringsplass
+                  )
                 ORDER BY n.id, ST_Distance(n.geom, rp.posisjon);
         ', schema_name, schema_name, schema_name, schema_name, schema_name);
     END IF;
@@ -203,6 +210,13 @@ BEGIN
             FROM %I.ruteinfopunkt rp
             JOIN %I.node_degree n ON ST_DWithin(n.geom, rp.posisjon, 100)  -- Node within 100m
             WHERE rp.posisjon IS NOT NULL
+              AND rp.tilrettelegging IN (
+                  ''12'', -- Hytte
+                  ''42'', -- Hytte betjent
+                  ''43'', -- Hytte selvbetjent
+                  ''44'', -- Hytte ubetjent
+                  ''22''  -- Parkeringsplass
+              )
         )
         SELECT DISTINCT
             n.node_id,
