@@ -20,9 +20,10 @@ import os
 import sys
 import subprocess
 import argparse
+import re
 from pathlib import Path
-from typing import List, Optional, Tuple
-
+from typing import List, Optional, Tuple, Dict
+from update_datasets import load_config
 
 def get_db_connection_params() -> dict:
     """Get database connection parameters from environment or defaults.
@@ -286,12 +287,138 @@ def run_build_links(db_params: dict, project_root: Path, quiet: bool = True) -> 
         return False
 
 
-def run_migration(db_params: dict, migration_file: Path) -> bool:
+def parse_psql_output(stdout: str, stderr: str, verbose: bool = False) -> Dict[str, List[str]]:
+    """Parse psql output to extract meaningful messages.
+
+    Args:
+        stdout: Standard output from psql
+        stderr: Standard error from psql
+        verbose: If True, include all output including SQL commands
+
+    Returns:
+        Dictionary with keys: 'notices', 'warnings', 'errors', 'sql' (if verbose)
+    """
+    result = {
+        'notices': [],
+        'warnings': [],
+        'errors': [],
+        'sql': [] if verbose else None
+    }
+
+    # Combine stdout and stderr (psql sends NOTICE/WARNING to stderr, but sometimes stdout too)
+    all_output = stdout + '\n' + stderr if stderr else stdout
+
+    lines = all_output.split('\n')
+    current_sql_block = []
+    in_sql_block = False
+
+    for line in lines:
+        line_stripped = line.strip()
+
+        # Skip empty lines
+        if not line_stripped:
+            if verbose and in_sql_block:
+                current_sql_block.append('')
+            continue
+
+        # Extract NOTICE messages
+        if 'NOTICE:' in line:
+            # Extract the actual notice message (after "NOTICE:")
+            notice_match = re.search(r'NOTICE:\s*(.+)', line, re.IGNORECASE)
+            if notice_match:
+                notice_msg = notice_match.group(1).strip()
+                # Filter out connection/authentication notices
+                if not any(skip in notice_msg.lower() for skip in [
+                    'connection', 'authentication', 'password', 'ssl', 'tls'
+                ]):
+                    result['notices'].append(notice_msg)
+            continue
+
+        # Extract WARNING messages
+        if 'WARNING:' in line:
+            warning_match = re.search(r'WARNING:\s*(.+)', line, re.IGNORECASE)
+            if warning_match:
+                result['warnings'].append(warning_match.group(1).strip())
+            continue
+
+        # Extract ERROR messages
+        if 'ERROR:' in line or line.startswith('ERROR'):
+            error_match = re.search(r'ERROR:\s*(.+)', line, re.IGNORECASE)
+            if error_match:
+                result['errors'].append(error_match.group(1).strip())
+            else:
+                result['errors'].append(line_stripped)
+            continue
+
+        # In verbose mode, collect SQL commands (lines that look like SQL)
+        if verbose:
+            # SQL commands typically start with keywords or are part of DO blocks
+            if (line_stripped.startswith(('CREATE', 'DROP', 'ALTER', 'SET', 'RESET', 'DO', 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'ANALYZE', 'EXECUTE')) or
+                line_stripped.startswith('--') or
+                in_sql_block):
+                if not in_sql_block and not line_stripped.startswith('--'):
+                    in_sql_block = True
+                current_sql_block.append(line)
+                # End of SQL block (semicolon at end, or END $$)
+                if line_stripped.endswith(';') or 'END $$' in line_stripped.upper():
+                    if current_sql_block:
+                        result['sql'].append('\n'.join(current_sql_block))
+                    current_sql_block = []
+                    in_sql_block = False
+
+    return result
+
+
+def extract_error_message(stdout: str, stderr: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """Extract the actual error message from psql output.
+
+    Args:
+        stdout: Standard output from psql
+        stderr: Standard error from psql
+
+    Returns:
+        Tuple of (error_message, hint, failing_sql_statement)
+    """
+    all_output = stdout + '\n' + (stderr or '')
+
+    # Look for ERROR: pattern
+    error_match = re.search(r'ERROR:\s*([^\n]+)', all_output, re.IGNORECASE | re.MULTILINE)
+    error_msg = error_match.group(1).strip() if error_match else None
+
+    # Look for HINT: pattern
+    hint_match = re.search(r'HINT:\s*([^\n]+)', all_output, re.IGNORECASE | re.MULTILINE)
+    hint = hint_match.group(1).strip() if hint_match else None
+
+    # Try to find the failing SQL statement (last CREATE/DROP/ALTER before error)
+    sql_match = None
+    lines = all_output.split('\n')
+    last_sql = []
+    for line in lines:
+        line_stripped = line.strip()
+        if line_stripped and not line_stripped.startswith('ERROR') and not line_stripped.startswith('HINT'):
+            if any(line_stripped.upper().startswith(kw) for kw in ['CREATE', 'DROP', 'ALTER', 'SET', 'RESET', 'DO', 'EXECUTE']):
+                last_sql = [line_stripped]
+            elif last_sql and not line_stripped.startswith('--'):
+                last_sql.append(line_stripped)
+                if line_stripped.endswith(';'):
+                    sql_match = ' '.join(last_sql)
+                    last_sql = []
+        elif line_stripped.startswith('ERROR'):
+            if last_sql:
+                sql_match = ' '.join(last_sql)
+            break
+
+    return (error_msg or "Unknown error", hint, sql_match)
+
+
+def run_migration(db_params: dict, migration_file: Path, verbose: bool = False, quiet: bool = False) -> bool:
     """Run a single migration file.
 
     Args:
         db_params: Database connection parameters
         migration_file: Path to SQL migration file
+        verbose: If True, show all SQL commands
+        quiet: If True, suppress all output except errors
 
     Returns:
         True if successful, False otherwise
@@ -310,8 +437,11 @@ def run_migration(db_params: dict, migration_file: Path) -> bool:
         '-d', db_params['database'],
         '-v', 'ON_ERROR_STOP=1',  # Stop on first error
         '-v', 'client_min_messages=notice',  # Show NOTICE and WARNING messages
-        '-a'  # Echo all commands (show what's being executed)
     ])
+    # Only add -a flag in verbose mode
+    if verbose:
+        cmd.append('-a')  # Echo all commands (show what's being executed)
+
     if migration_file.name != '000_setup_roles.sql':
         cmd.extend([
             '-c', "SET ROLE stiflyt_owner;"
@@ -328,16 +458,25 @@ def run_migration(db_params: dict, migration_file: Path) -> bool:
             text=True,
             check=True
         )
-        # Print notices and output (NOTICE messages go to stderr in psql)
-        if result.stdout:
-            print(result.stdout, end='')
-        if result.stderr:
-            # Filter out connection notices, but show important messages
-            stderr_lines = result.stderr.split('\n')
-            for line in stderr_lines:
-                # Show NOTICE and WARNING messages (they're important)
-                if 'NOTICE:' in line or 'WARNING:' in line:
-                    print(line, file=sys.stderr)
+
+        # Parse output intelligently
+        parsed = parse_psql_output(result.stdout, result.stderr, verbose=verbose)
+
+        # In verbose mode, show all SQL
+        if verbose and parsed['sql']:
+            for sql_block in parsed['sql']:
+                print(sql_block)
+
+        # Show warnings (always, unless quiet)
+        if not quiet:
+            for warning in parsed['warnings']:
+                print(f"     ⚠ {warning}", file=sys.stderr)
+
+        # Show notices only in verbose mode (suppress in normal mode for clean single-line output)
+        if verbose:
+            for notice in parsed['notices']:
+                print(f"     ℹ {notice}")
+
         return True
     except subprocess.CalledProcessError as e:
         # For 000_setup_roles.sql, try running as postgres superuser if permission errors occur
@@ -345,8 +484,9 @@ def run_migration(db_params: dict, migration_file: Path) -> bool:
             # Check if error is permission-related
             error_output = (e.stdout or '') + (e.stderr or '')
             if any(phrase in error_output for phrase in ['permission denied', 'must be owner', 'insufficient_privilege']):
-                print(f"  ⚠ {migration_file.name} feilet med permission errors", file=sys.stderr)
-                print(f"  ℹ Prøver som postgres superuser...", file=sys.stderr)
+                if not quiet:
+                    print(f"  ⚠ {migration_file.name} feilet med permission errors", file=sys.stderr)
+                    print(f"  ℹ Prøver som postgres superuser...", file=sys.stderr)
 
                 # Try as postgres superuser
                 postgres_cmd = ['sudo', '-u', 'postgres', 'psql']
@@ -355,8 +495,9 @@ def run_migration(db_params: dict, migration_file: Path) -> bool:
                     '-f', str(migration_file),
                     '-v', 'ON_ERROR_STOP=1',
                     '-v', 'client_min_messages=notice',
-                    '-a'
                 ])
+                if verbose:
+                    postgres_cmd.append('-a')
 
                 try:
                     postgres_result = subprocess.run(
@@ -365,31 +506,53 @@ def run_migration(db_params: dict, migration_file: Path) -> bool:
                         text=True,
                         check=True
                     )
-                    # Print notices and output
-                    if postgres_result.stdout:
-                        print(postgres_result.stdout, end='')
-                    if postgres_result.stderr:
-                        stderr_lines = postgres_result.stderr.split('\n')
-                        for line in stderr_lines:
-                            if 'NOTICE:' in line or 'WARNING:' in line:
-                                print(line, file=sys.stderr)
-                    print(f"  ✓ {migration_file.name} fullført som postgres superuser", file=sys.stderr)
+                    # Parse output intelligently
+                    parsed = parse_psql_output(postgres_result.stdout, postgres_result.stderr, verbose=verbose)
+
+                    if verbose and parsed['sql']:
+                        for sql_block in parsed['sql']:
+                            print(sql_block)
+
+                    if not quiet:
+                        for warning in parsed['warnings']:
+                            print(f"     ⚠ {warning}", file=sys.stderr)
+
+                    # Show notices only in verbose mode
+                    if verbose:
+                        for notice in parsed['notices']:
+                            print(f"     ℹ {notice}")
+
+                    if not quiet:
+                        print(f"  ✓ {migration_file.name} fullført som postgres superuser", file=sys.stderr)
                     return True
                 except subprocess.CalledProcessError as postgres_e:
+                    # Extract error message
+                    error_msg, hint, failing_sql = extract_error_message(
+                        postgres_e.stdout or '', postgres_e.stderr or ''
+                    )
                     print(f"✗ Migration failed even as postgres: {migration_file.name}", file=sys.stderr)
-                    if postgres_e.stdout:
-                        print(postgres_e.stdout, file=sys.stderr)
-                    if postgres_e.stderr:
-                        print(postgres_e.stderr, file=sys.stderr)
+                    print(f"  Feil: {error_msg}", file=sys.stderr)
+                    if hint:
+                        print(f"  Hint: {hint}", file=sys.stderr)
+                    if failing_sql and verbose:
+                        print(f"  Feilende kommando: {failing_sql[:200]}...", file=sys.stderr)
                     return False
                 except FileNotFoundError:
-                    print(f"  ⚠ sudo ikke tilgjengelig, kan ikke prøve som postgres", file=sys.stderr)
+                    if not quiet:
+                        print(f"  ⚠ sudo ikke tilgjengelig, kan ikke prøve som postgres", file=sys.stderr)
 
+        # Extract error message from main failure
+        error_msg, hint, failing_sql = extract_error_message(e.stdout or '', e.stderr or '')
         print(f"✗ Migration failed: {migration_file.name}", file=sys.stderr)
-        if e.stdout:
-            print(e.stdout, file=sys.stderr)
-        if e.stderr:
-            print(e.stderr, file=sys.stderr)
+        print(f"  Feil: {error_msg}", file=sys.stderr)
+        if hint:
+            print(f"  Hint: {hint}", file=sys.stderr)
+        if failing_sql and verbose:
+            print(f"  Feilende kommando: {failing_sql[:200]}...", file=sys.stderr)
+        elif failing_sql and not quiet:
+            # Show truncated SQL even in normal mode
+            sql_preview = failing_sql[:100] + '...' if len(failing_sql) > 100 else failing_sql
+            print(f"  Feilende kommando: {sql_preview}", file=sys.stderr)
         return False
     except FileNotFoundError:
         print("Feil: psql ikke funnet. Er PostgreSQL installert?", file=sys.stderr)
@@ -500,6 +663,35 @@ def check_owner_membership(db_params: dict) -> bool:
     return True
 
 
+def is_osm_enabled(project_root: Path) -> bool:
+    """Check if OSM is enabled in datasets.yaml.
+
+    Args:
+        project_root: Root directory of the project
+
+    Returns:
+        True if OSM dataset is enabled (uncommented), False otherwise
+    """
+
+    config_path = project_root / 'datasets.yaml'
+    if not config_path.exists():
+        return False
+
+    try:
+        configs = load_config(config_path)
+        if not isinstance(configs, list):
+            return False
+
+        # Check if any dataset has format: OSM (uncommented)
+        for cfg in configs:
+            if isinstance(cfg, dict) and cfg.get('format', '').upper() == 'OSM':
+                return True
+
+        return False
+    except Exception:
+        return False
+
+
 def main():
     """Main function."""
     parser = argparse.ArgumentParser(description='Run database migrations')
@@ -507,8 +699,17 @@ def main():
                        help='Database name (default: from PGDATABASE env)')
     parser.add_argument('--migration-dir', default='migrations',
                        help='Directory containing migration files (default: migrations)')
+    parser.add_argument('--quiet', '-q', action='store_true',
+                       help='Suppress all output except errors')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Show all SQL commands and detailed output')
 
     args = parser.parse_args()
+
+    # Quiet and verbose are mutually exclusive
+    if args.quiet and args.verbose:
+        print("Feil: --quiet og --verbose kan ikke brukes samtidig", file=sys.stderr)
+        sys.exit(1)
 
     # Setup
     script_dir = Path(__file__).parent
@@ -526,22 +727,26 @@ def main():
     migration_files = find_migration_files(migration_dir)
 
     if not migration_files:
-        print(f"ℹ Ingen migrasjoner funnet i {migration_dir}")
+        if not args.quiet:
+            print(f"ℹ Ingen migrasjoner funnet i {migration_dir}")
         sys.exit(0)
 
     # Preflight: ensure role membership for ownership
     if not check_owner_membership(db_params):
         sys.exit(1)
 
-    print(f"==> Kjører migrasjoner for database '{db_params['database']}' ...")
-    print(f"  Fant {len(migration_files)} migrasjon(er) i {migration_dir}")
+    if not args.quiet:
+        print(f"==> Kjører migrasjoner for database '{db_params['database']}' ...")
+        print(f"  Fant {len(migration_files)} migrasjon(er) i {migration_dir}")
 
     # Check if build-links needs to run before migration 003
     migration_003 = next((f for f in migration_files if '003' in f.name), None)
     if migration_003 and should_run_build_links(migration_003, db_params):
-        print(f"  -> Kjører build-links (kreves før migrasjon 003)...")
-        if run_build_links(db_params, project_root, quiet=True):
-            print(f"     ✓ build-links fullført")
+        if not args.quiet:
+            print(f"  -> Kjører build-links (kreves før migrasjon 003)...")
+        if run_build_links(db_params, project_root, quiet=args.quiet or not args.verbose):
+            if not args.quiet:
+                print(f"     ✓ build-links fullført")
         else:
             print(f"     ✗ build-links feilet", file=sys.stderr)
             print(f"     ⚠ KRITISK: Migrasjon 003 vil feile uten links-tabellen", file=sys.stderr)
@@ -549,7 +754,7 @@ def main():
             print(f"     ⚠ Kjør 'make build-links' manuelt og re-run migrasjoner", file=sys.stderr)
             # Continue anyway - migration 003 will handle the error gracefully
             # But we'll verify at the end that views were created
-    elif migration_003:
+    elif migration_003 and not args.quiet:
         print(f"  ⊙ build-links ikke nødvendig (links-tabellen eksisterer allerede)")
 
     # KRITISK: Check if spatial index exists on teig.omrade
@@ -559,8 +764,14 @@ def main():
         print(f"     Dette kan forårsake alvorlige ytelsesproblemer.", file=sys.stderr)
         print(f"     PostGIS bør opprette indeksen automatisk, men hvis ikke:", file=sys.stderr)
         print(f"     CREATE INDEX teig_omrade_gix ON <schema>.teig USING GIST (omrade);", file=sys.stderr)
-    else:
+    elif not args.quiet:
         print(f"  ✓ Spatial index eksisterer på teig.omrade (PostGIS oppretter automatisk)")
+
+    # Check if OSM is enabled before running OSM migration
+    osm_enabled = is_osm_enabled(project_root)
+    migration_006 = next((f for f in migration_files if f.name.startswith('006_')), None)
+    if migration_006 and not osm_enabled and not args.quiet:
+        print(f"  ⊙ OSM er ikke aktivert i datasets.yaml - hopper over {migration_006.name}")
 
     # Run migrations in order
     # All migrations are idempotent, so we run them all every time
@@ -570,34 +781,51 @@ def main():
     failed_migrations = []
 
     for migration_file in migration_files:
-        print(f"  -> Kjører {migration_file.name} ...")
-        if run_migration(db_params, migration_file):
-            print(f"     ✓ {migration_file.name} fullført")
+        # Skip OSM migration (006) if OSM is not enabled
+        if migration_file == migration_006 and not osm_enabled:
+            if not args.quiet:
+                print(f"  ⊙ Hoppet over {migration_file.name} (OSM ikke aktivert)")
+            continue
+
+        # Run migration and show single-line result
+        if run_migration(db_params, migration_file, verbose=args.verbose, quiet=args.quiet):
+            if not args.quiet:
+                print(f"  ✓ {migration_file.name} fullført")
             success_count += 1
         else:
-            print(f"     ✗ {migration_file.name} feilet")
+            if not args.quiet:
+                print(f"  ✗ {migration_file.name} feilet")
             failed_count += 1
             failed_migrations.append(migration_file.name)
             # Stop on first failure
-            print(f"", file=sys.stderr)
-            print(f"✗ Migrasjon feilet - stopper videre kjøring", file=sys.stderr)
-            print(f"  Feilet på: {migration_file.name}", file=sys.stderr)
+            if not args.quiet:
+                print(f"", file=sys.stderr)
+                print(f"✗ Migrasjon feilet - stopper videre kjøring", file=sys.stderr)
+                print(f"  Feilet på: {migration_file.name}", file=sys.stderr)
             break
 
     # Summary
-    print(f"==> Migrasjoner fullført")
-    if success_count > 0:
-        print(f"  ✓ Vellykket: {success_count}")
     if failed_count > 0:
-        print(f"  ✗ Feilet: {failed_count}")
-        print(f"  Feilede migrasjoner: {', '.join(failed_migrations)}")
+        if not args.quiet:
+            print(f"==> Migrasjoner fullført")
+            print(f"  ✗ Feilet: {failed_count}")
+            print(f"  Feilede migrasjoner: {', '.join(failed_migrations)}")
+        else:
+            # In quiet mode, still show failures
+            print(f"✗ {failed_count} migrasjon(er) feilet: {', '.join(failed_migrations)}", file=sys.stderr)
+    elif not args.quiet:
+        print(f"==> Migrasjoner fullført")
+        if success_count > 0:
+            print(f"  ✓ Vellykket: {success_count}")
 
     # Verify critical views exist (even if migrations "succeeded")
     # This catches cases where migrations skip silently (e.g., if build-links failed)
-    print(f"==> Verifiserer kritiske views...")
+    if not args.quiet:
+        print(f"==> Verifiserer kritiske views...")
     all_views_exist, missing_views = verify_critical_views(db_params)
     if all_views_exist:
-        print(f"  ✓ Alle kritiske views eksisterer")
+        if not args.quiet:
+            print(f"  ✓ Alle kritiske views eksisterer")
     else:
         print(f"  ✗ KRITISK: Manglende views i stiflyt schema:", file=sys.stderr)
         for view in missing_views:

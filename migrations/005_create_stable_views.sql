@@ -73,6 +73,7 @@ BEGIN
             SELECT unnest(ARRAY[
                 'fotrute',
                 'fotruteinfo',
+                'ruteinfopunkt',
                 'links',
                 'link_segments',
                 'nodes',
