@@ -177,6 +177,37 @@ BEGIN
                 END IF;
             END IF;
         END LOOP;
+        
+        -- Create stable view for route_continuous_geometries table (created by build-links)
+        -- This is a table, not a view, but we expose it via a view for stable schema access
+        IF EXISTS (
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = dynamic_schema
+              AND table_name = 'route_continuous_geometries'
+        ) THEN
+            -- Drop existing view if it exists (for idempotency)
+            EXECUTE format('DROP VIEW IF EXISTS %I.route_continuous_geometries CASCADE', view_schema);
+            
+            -- Create view pointing to current dynamic schema table
+            EXECUTE format('CREATE VIEW %I.route_continuous_geometries AS SELECT * FROM %I.route_continuous_geometries',
+                view_schema, dynamic_schema);
+            RAISE NOTICE 'Created stable view: %.route_continuous_geometries -> %.route_continuous_geometries', view_schema, dynamic_schema;
+        ELSE
+            -- Check if links table exists (if it does, route_continuous_geometries should have been created by build-links)
+            IF EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = dynamic_schema AND table_name = 'links'
+            ) THEN
+                RAISE WARNING 'KRITISK: Table %.route_continuous_geometries does not exist, but %.links table exists!',
+                             dynamic_schema, dynamic_schema;
+                RAISE WARNING 'This indicates build-links may not have run or failed.';
+                RAISE WARNING 'Solution: Run build-links to create route_continuous_geometries table.';
+            ELSE
+                RAISE NOTICE 'Table %.route_continuous_geometries does not exist (links table also missing - may be created later)',
+                           dynamic_schema;
+            END IF;
+        END IF;
     END IF;
 
     -- Create stable views for matrikkel tables (if schema exists)

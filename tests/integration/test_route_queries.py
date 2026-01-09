@@ -600,6 +600,21 @@ def test_links_with_routes_has_route_geometries():
             assert column is not None, "links_with_routes should have route_geometries column"
             assert column['data_type'] == 'jsonb', "route_geometries should be JSONB type"
 
+            # Check if stable view stiflyt.route_continuous_geometries exists
+            # (links_with_routes depends on this view/table)
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.views
+                    WHERE table_schema = 'stiflyt'
+                      AND table_name = 'route_continuous_geometries'
+                ) as view_exists
+            """)
+            result = cur.fetchone()
+            view_exists = result['view_exists'] if result else False
+
+            assert view_exists, "stiflyt.route_continuous_geometries view should exist (migration 005 should have created it, required for links_with_routes.route_geometries)"
+
             # Get a link that belongs to at least one route
             cur.execute("""
                 SELECT
@@ -683,6 +698,21 @@ def test_route_geometries_continuous():
                 pytest.skip("No routes with multiple links found")
 
             test_rutenummer = route_info['rutenummer']
+
+            # Check if stable view stiflyt.route_continuous_geometries exists
+            # (links_with_routes depends on this view/table)
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.views
+                    WHERE table_schema = 'stiflyt'
+                      AND table_name = 'route_continuous_geometries'
+                ) as view_exists
+            """)
+            result = cur.fetchone()
+            view_exists = result['view_exists'] if result else False
+
+            assert view_exists, "stiflyt.route_continuous_geometries view should exist (migration 005 should have created it, required for links_with_routes.route_geometries)"
 
             # Get the continuous geometry from links_with_routes (from route_continuous_geometries table)
             cur.execute("""
@@ -768,7 +798,21 @@ def test_multilinestring_reason():
 
             schema_name = schema_result['nspname']
 
-            # First, check if route_continuous_geometries table exists
+            # First, check if stable view stiflyt.route_continuous_geometries exists
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.views
+                    WHERE table_schema = 'stiflyt'
+                      AND table_name = 'route_continuous_geometries'
+                ) as view_exists
+            """)
+            result = cur.fetchone()
+            view_exists = result['view_exists'] if result else False
+
+            assert view_exists, "stiflyt.route_continuous_geometries view should exist (migration 005 should have created it)"
+
+            # Also check if route_continuous_geometries table exists in dynamic schema
             cur.execute("""
                 SELECT EXISTS (
                     SELECT 1
@@ -780,7 +824,7 @@ def test_multilinestring_reason():
             result = cur.fetchone()
             table_exists = result['table_exists'] if result else False
 
-            assert table_exists, "route_continuous_geometries table should exist (build-links should have run)"
+            assert table_exists, "route_continuous_geometries table should exist in dynamic schema (build-links should have run)"
 
             # Check if multilinestring_reason column exists
             cur.execute("""
@@ -796,7 +840,8 @@ def test_multilinestring_reason():
             assert column['data_type'] == 'text', "multilinestring_reason should be TEXT type"
 
             # Get some routes with their reasons - prioritize routes with non-single_linestring reasons
-            cur.execute(f"""
+            # Use the stable view stiflyt.route_continuous_geometries instead of direct table access
+            cur.execute("""
                 (
                     SELECT
                         rutenummer,
@@ -804,7 +849,7 @@ def test_multilinestring_reason():
                         multilinestring_reason,
                         ST_GeometryType(continuous_geometry) as geom_type,
                         ST_NumGeometries(continuous_geometry) as num_geoms
-                    FROM {schema_name}.route_continuous_geometries
+                    FROM stiflyt.route_continuous_geometries
                     WHERE continuous_geometry IS NOT NULL
                       AND multilinestring_reason != 'single_linestring'
                     LIMIT 5
@@ -817,7 +862,7 @@ def test_multilinestring_reason():
                         multilinestring_reason,
                         ST_GeometryType(continuous_geometry) as geom_type,
                         ST_NumGeometries(continuous_geometry) as num_geoms
-                    FROM {schema_name}.route_continuous_geometries
+                    FROM stiflyt.route_continuous_geometries
                     WHERE continuous_geometry IS NOT NULL
                     LIMIT 5
                 )
