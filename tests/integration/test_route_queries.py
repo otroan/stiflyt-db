@@ -578,3 +578,305 @@ def test_route_geometry_aggregation():
     finally:
         conn.close()
 
+
+@pytest.mark.integration
+def test_links_with_routes_has_route_geometries():
+    """Test that links_with_routes view has route_geometries column with continuous geometry."""
+    db_params = load_dataset.get_db_connection_params()
+    if not db_params.get("database"):
+        pytest.skip("PGDATABASE not set")
+
+    conn = psycopg2.connect(**_connection_kwargs(db_params))
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Check that route_geometries column exists
+            cur.execute("""
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'stiflyt' AND table_name = 'links_with_routes'
+                  AND column_name = 'route_geometries'
+            """)
+            column = cur.fetchone()
+            assert column is not None, "links_with_routes should have route_geometries column"
+            assert column['data_type'] == 'jsonb', "route_geometries should be JSONB type"
+
+            # Get a link that belongs to at least one route
+            cur.execute("""
+                SELECT
+                    link_id,
+                    rutenummer_list,
+                    route_geometries
+                FROM stiflyt.links_with_routes
+                WHERE rutenummer_list IS NOT NULL
+                  AND array_length(rutenummer_list, 1) > 0
+                LIMIT 1
+            """)
+            link = cur.fetchone()
+            if not link:
+                pytest.skip("No links with routes found")
+
+            assert link['rutenummer_list'] is not None, "rutenummer_list should not be null"
+            assert len(link['rutenummer_list']) > 0, "Should have at least one route"
+
+            # Test that route_geometries contains continuous geometry from route_continuous_geometries table
+            test_rutenummer = link['rutenummer_list'][0]
+
+            # Check if route_geometries contains the route
+            # route_geometries is a JSONB object from route_continuous_geometries table
+            # Use ->> to get text (GeoJSON string) instead of -> (JSONB object)
+            cur.execute("""
+                SELECT
+                    route_geometries ? %s as has_route,
+                    route_geometries->>%s as route_geom_json_text
+                FROM stiflyt.links_with_routes
+                WHERE link_id = %s
+            """, (test_rutenummer, test_rutenummer, link['link_id']))
+            result = cur.fetchone()
+
+            # route_geometries should contain the route (from route_continuous_geometries table)
+            if result and result['has_route'] and result['route_geom_json_text']:
+                # route_geom_json_text is a GeoJSON string, convert it to geometry
+                # Use ST_GeomFromGeoJSON to convert GeoJSON to PostGIS geometry
+                cur.execute("""
+                    SELECT
+                        ST_IsValid(ST_GeomFromGeoJSON(%s)) as is_valid,
+                        ST_GeometryType(ST_GeomFromGeoJSON(%s)) as geom_type,
+                        ST_Length(ST_GeomFromGeoJSON(%s)) as length
+                """, (result['route_geom_json_text'], result['route_geom_json_text'], result['route_geom_json_text']))
+                geom_info = cur.fetchone()
+
+                assert geom_info is not None, f"Should be able to parse geometry for {test_rutenummer}"
+                assert geom_info['is_valid'], f"Route geometry for {test_rutenummer} should be valid"
+                assert geom_info['length'] > 0, f"Route geometry for {test_rutenummer} should have positive length"
+            else:
+                # route_geometries might be null if route_continuous_geometries table hasn't been populated yet
+                # This is OK, but we should at least verify the column exists
+                assert link['route_geometries'] is not None or link['route_geometries'] == {}, \
+                    "route_geometries should exist (may be null if build-links hasn't run yet)"
+    finally:
+        conn.close()
+
+
+@pytest.mark.integration
+def test_route_geometries_continuous():
+    """Test that route_geometries provides continuous geometry for routes where possible."""
+    db_params = load_dataset.get_db_connection_params()
+    if not db_params.get("database"):
+        pytest.skip("PGDATABASE not set")
+
+    conn = psycopg2.connect(**_connection_kwargs(db_params))
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Find a route that has multiple links (more likely to test continuity)
+            cur.execute("""
+                SELECT
+                    lri.rutenummer,
+                    COUNT(DISTINCT lri.link_id) as link_count
+                FROM stiflyt.link_ruteinfo lri
+                GROUP BY lri.rutenummer
+                HAVING COUNT(DISTINCT lri.link_id) > 1
+                ORDER BY link_count DESC
+                LIMIT 1
+            """)
+            route_info = cur.fetchone()
+            if not route_info:
+                pytest.skip("No routes with multiple links found")
+
+            test_rutenummer = route_info['rutenummer']
+
+            # Get the continuous geometry from links_with_routes (from route_continuous_geometries table)
+            cur.execute("""
+                SELECT
+                    route_geometries->>%s as continuous_geom
+                FROM stiflyt.links_with_routes
+                WHERE %s = ANY(rutenummer_list)
+                LIMIT 1
+            """, (test_rutenummer, test_rutenummer))
+            result = cur.fetchone()
+
+            if not result or not result['continuous_geom']:
+                pytest.skip(f"No continuous geometry computed for route {test_rutenummer} (build-links may need to run)")
+
+            continuous_geom = result['continuous_geom']
+
+            # Compare with simple union of link geometries (should be same or better)
+            cur.execute("""
+                WITH route_links AS (
+                    SELECT DISTINCT l.geom
+                    FROM stiflyt.links l
+                    JOIN stiflyt.link_ruteinfo lri ON lri.link_id = l.link_id
+                    WHERE lri.rutenummer = %s
+                )
+                SELECT
+                    ST_Union(geom) as simple_union_geom,
+                    ST_LineMerge(ST_Union(geom)) as merged_union_geom
+                FROM route_links
+            """, (test_rutenummer,))
+            union_result = cur.fetchone()
+
+            if union_result and union_result['simple_union_geom']:
+                # Verify continuous geometry is valid
+                cur.execute("""
+                    SELECT
+                        ST_IsValid(%s::geometry) as is_valid,
+                        ST_GeometryType(%s::geometry) as geom_type,
+                        ST_NumGeometries(%s::geometry) as num_parts,
+                        ST_Length(%s::geometry) as length
+                """, (continuous_geom, continuous_geom, continuous_geom, continuous_geom))
+                continuous_info = cur.fetchone()
+
+                assert continuous_info['is_valid'], f"Continuous geometry for {test_rutenummer} should be valid"
+                assert continuous_info['length'] > 0, f"Continuous geometry for {test_rutenummer} should have positive length"
+
+                # The continuous geometry should ideally be a LINESTRING (single part) or have fewer parts than simple union
+                # (indicating that links were properly connected)
+                cur.execute("""
+                    SELECT
+                        ST_NumGeometries(%s::geometry) as union_parts
+                """, (union_result['simple_union_geom'],))
+                union_parts = cur.fetchone()['union_parts']
+
+                # Continuous geometry should have same or fewer parts (better connected)
+                assert continuous_info['num_parts'] <= union_parts, \
+                    f"Continuous geometry should have same or fewer parts than simple union " \
+                    f"({continuous_info['num_parts']} vs {union_parts})"
+    finally:
+        conn.close()
+
+
+@pytest.mark.integration
+def test_multilinestring_reason():
+    """Test that multilinestring_reason column exists and provides meaningful reasons."""
+    db_params = load_dataset.get_db_connection_params()
+    if not db_params.get("database"):
+        pytest.skip("PGDATABASE not set")
+
+    conn = psycopg2.connect(**_connection_kwargs(db_params))
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Find the dynamic schema
+            cur.execute("""
+                SELECT nspname
+                FROM pg_namespace
+                WHERE nspname LIKE 'turogfriluftsruter_%'
+                ORDER BY nspname DESC
+                LIMIT 1
+            """)
+            schema_result = cur.fetchone()
+            if not schema_result:
+                pytest.skip("No turrutebasen schema found")
+
+            schema_name = schema_result['nspname']
+
+            # First, check if route_continuous_geometries table exists
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = %s
+                      AND table_name = 'route_continuous_geometries'
+                ) as table_exists
+            """, (schema_name,))
+            result = cur.fetchone()
+            table_exists = result['table_exists'] if result else False
+
+            assert table_exists, "route_continuous_geometries table should exist (build-links should have run)"
+
+            # Check if multilinestring_reason column exists
+            cur.execute("""
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = 'route_continuous_geometries'
+                  AND column_name = 'multilinestring_reason'
+            """, (schema_name,))
+            column = cur.fetchone()
+
+            assert column is not None, "multilinestring_reason column should exist in route_continuous_geometries (build-links should have run with latest version)"
+            assert column['data_type'] == 'text', "multilinestring_reason should be TEXT type"
+
+            # Get some routes with their reasons - prioritize routes with non-single_linestring reasons
+            cur.execute(f"""
+                (
+                    SELECT
+                        rutenummer,
+                        continuous_geometry,
+                        multilinestring_reason,
+                        ST_GeometryType(continuous_geometry) as geom_type,
+                        ST_NumGeometries(continuous_geometry) as num_geoms
+                    FROM {schema_name}.route_continuous_geometries
+                    WHERE continuous_geometry IS NOT NULL
+                      AND multilinestring_reason != 'single_linestring'
+                    LIMIT 5
+                )
+                UNION ALL
+                (
+                    SELECT
+                        rutenummer,
+                        continuous_geometry,
+                        multilinestring_reason,
+                        ST_GeometryType(continuous_geometry) as geom_type,
+                        ST_NumGeometries(continuous_geometry) as num_geoms
+                    FROM {schema_name}.route_continuous_geometries
+                    WHERE continuous_geometry IS NOT NULL
+                    LIMIT 5
+                )
+            """)
+            routes = cur.fetchall()
+
+            if not routes:
+                pytest.skip("No routes found in route_continuous_geometries (build-links may need to run)")
+
+            # Valid reasons
+            valid_reasons = {
+                'single_linestring',
+                'link_is_multilinestring',
+                'loop_or_branch',
+                'precision_gap',
+                'disconnected_components',
+                'traversal_issue'
+            }
+
+            # Check that all routes have valid reasons and print examples
+            print(f"\n  Found {len(routes)} routes with multilinestring_reason:")
+            reason_counts = {}
+
+            for route in routes:
+                reason = route['multilinestring_reason']
+                num_geoms = route['num_geoms']
+                geom_type = route['geom_type']
+
+                assert reason is not None, f"Route {route['rutenummer']} should have a multilinestring_reason"
+                assert reason in valid_reasons, \
+                    f"Route {route['rutenummer']} has invalid reason: {reason}"
+
+                # Count reasons
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+                # If it's a single LineString, reason should be 'single_linestring'
+                if geom_type == 'ST_LineString' or (geom_type == 'ST_MultiLineString' and num_geoms == 1):
+                    assert reason == 'single_linestring', \
+                        f"Route {route['rutenummer']} is LineString but reason is {reason}, expected 'single_linestring'"
+
+                # If it's MultiLineString with multiple parts, reason should not be 'single_linestring'
+                if geom_type == 'ST_MultiLineString' and num_geoms > 1:
+                    assert reason != 'single_linestring', \
+                        f"Route {route['rutenummer']} is MultiLineString with {num_geoms} parts but reason is 'single_linestring'"
+
+            # Print summary of reasons found
+            print(f"  Reason distribution:")
+            for reason, count in sorted(reason_counts.items()):
+                print(f"    {reason}: {count} route(s)")
+
+            # Print first few examples
+            print(f"  Example routes:")
+            for route in routes[:5]:
+                print(f"    {route['rutenummer']}: {route['multilinestring_reason']} "
+                      f"({route['geom_type']}, {route['num_geoms']} part(s))")
+
+            # Check that we have at least one route with a reason
+            assert len(routes) > 0, "Should have at least one route to test"
+
+    finally:
+        conn.close()
+

@@ -942,6 +942,99 @@ def extract_table_names_from_zip_sql(zip_path: Path, sql_file_in_zip: str) -> Tu
     return table_names, schema_prefix
 
 
+def filter_to_dnt_routes(db_params: dict, schema_prefix: Optional[str]) -> bool:
+    """Filter imported data to only DNT routes if DEV_FILTER_DNT is set.
+    
+    Deletes fotruteinfo and fotrute rows that don't belong to DNT routes.
+    """
+    dev_filter = os.environ.get('DEV_FILTER_DNT', '').lower() in ('true', '1', 'yes', 'on')
+    if not dev_filter:
+        return True  # No filtering needed
+    
+    print("  ℹ DEV_FILTER_DNT er aktivert - filtrerer til DNT-ruter...")
+    
+    env = os.environ.copy()
+    if db_params.get('password'):
+        env['PGPASSWORD'] = db_params['password']
+    
+    cmd = ['psql', '-v', 'ON_ERROR_STOP=1']
+    if db_params.get('host'):
+        cmd.extend(['-h', db_params['host']])
+    if db_params.get('port'):
+        cmd.extend(['-p', str(db_params['port'])])
+    cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q'])
+    
+    if schema_prefix:
+        # Find the actual schema name
+        find_schema_sql = f"""
+            SELECT nspname
+            FROM pg_namespace
+            WHERE nspname LIKE '{schema_prefix}_%'
+            ORDER BY nspname DESC
+            LIMIT 1;
+        """
+        try:
+            result = subprocess.run(
+                cmd + ['-t', '-A'],
+                input=find_schema_sql,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            schema_name = result.stdout.strip()
+            if not schema_name:
+                print("  ⚠ Kunne ikke finne schema for filtrering", file=sys.stderr)
+                return True
+        except subprocess.CalledProcessError:
+            print("  ⚠ Kunne ikke finne schema for filtrering", file=sys.stderr)
+            return True
+    else:
+        print("  ⚠ Kunne ikke finne schema prefix for filtrering", file=sys.stderr)
+        return True
+    
+    print(f"  -> Filtrerer til DNT-ruter i schema {schema_name}...")
+    
+    # Filter fotruteinfo and fotrute to only DNT routes
+    # DNT routes typically have vedlikeholdsansvarlig = 'DNT' or rutenummer starting with 'bre', 'jot', 'ron', etc.
+    filter_sql = f"""
+    {role_preamble_sql()}
+    -- Delete fotruteinfo rows that don't belong to DNT routes
+    DELETE FROM {schema_name}.fotruteinfo
+    WHERE vedlikeholdsansvarlig != 'DNT'
+       AND NOT (rutenummer LIKE 'bre%' OR rutenummer LIKE 'jot%' OR rutenummer LIKE 'ron%');
+    
+    -- Delete fotrute segments that don't have any fotruteinfo (orphaned segments)
+    DELETE FROM {schema_name}.fotrute
+    WHERE objid NOT IN (SELECT DISTINCT fotrute_fk FROM {schema_name}.fotruteinfo WHERE fotrute_fk IS NOT NULL);
+    
+    -- Clean up orphaned nodes (nodes not referenced by any remaining segments)
+    DELETE FROM {schema_name}.nodes
+    WHERE node_id NOT IN (
+        SELECT DISTINCT source_node FROM {schema_name}.fotrute WHERE source_node IS NOT NULL
+        UNION
+        SELECT DISTINCT target_node FROM {schema_name}.fotrute WHERE target_node IS NOT NULL
+    );
+    
+    {role_reset_sql()}
+    """
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            input=filter_sql,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        print(f"     ✓ Filtrert til DNT-ruter")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"     ⚠ Kunne ikke filtrere data: {e.stderr}", file=sys.stderr)
+        return False
+
+
 def load_postgis_sql_from_zip_stream(
     db_params: dict,
     zip_path: Path,
@@ -2092,6 +2185,11 @@ def load_dataset(
                     print(f"==> Ferdig. {len(files_in_zip)} SQL-fil(er) lastet inn (uten ekstraksjon)")
                     # Extract schema prefix to analyze imported tables
                     table_names, schema_prefix = extract_table_names_from_zip_sql(zip_path, files_in_zip[0])
+                    
+                    # Filter to DNT routes if DEV_FILTER_DNT is set
+                    if schema_prefix:
+                        filter_to_dnt_routes(db_params, schema_prefix)
+                    
                     if schema_prefix:
                         grant_privileges_for_schema_prefix(db_params, schema_prefix)
                     else:
@@ -2178,6 +2276,11 @@ def load_dataset(
                 print(f"==> Ferdig. {len(files)} SQL-fil(er) lastet inn")
                 # Extract table names from first SQL file
                 table_names, schema_prefix = extract_table_names_from_sql(files[0])
+                
+                # Filter to DNT routes if DEV_FILTER_DNT is set
+                if schema_prefix:
+                    filter_to_dnt_routes(db_params, schema_prefix)
+                
                 if schema_prefix:
                     grant_privileges_for_schema_prefix(db_params, schema_prefix)
                 else:

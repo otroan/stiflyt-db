@@ -95,32 +95,50 @@ BEGIN
         RAISE NOTICE 'This is non-fatal - view will be skipped';
     END;
 
+    -- Note: route_continuous_geometries table is created by build-links
+    -- Not created here to avoid blocking migration with expensive computations
+
     -- Create a simpler view that aggregates ruteinfo per link
     -- This gives one row per link with aggregated route information
+    -- Includes continuous geometry from materialized view
     BEGIN
         EXECUTE format('
             DROP VIEW IF EXISTS %I.links_with_routes CASCADE;
 
             CREATE VIEW %I.links_with_routes AS
-            SELECT
-                l.link_id,
-                l.a_node,
-                l.b_node,
-                l.length_m,
-                l.geom,
-                l.segment_objids,
-                -- Aggregate route information (distinct values)
-                array_agg(DISTINCT fi.rutenavn) FILTER (WHERE fi.rutenavn IS NOT NULL) as rutenavn_list,
-                array_agg(DISTINCT fi.rutenummer) FILTER (WHERE fi.rutenummer IS NOT NULL) as rutenummer_list,
-                array_agg(DISTINCT fi.vedlikeholdsansvarlig) FILTER (WHERE fi.vedlikeholdsansvarlig IS NOT NULL) as vedlikeholdsansvarlig_list,
-                array_agg(DISTINCT fi.rutetype) FILTER (WHERE fi.rutetype IS NOT NULL) as rutetype_list
-            FROM %I.links l
-            LEFT JOIN LATERAL unnest(COALESCE(l.segment_objids, ARRAY[]::bigint[])) AS segment_objid ON true
-            LEFT JOIN %I.fotruteinfo fi ON fi.fotrute_fk = segment_objid
-            GROUP BY l.link_id, l.a_node, l.b_node, l.length_m, l.geom, l.segment_objids;
-        ', schema_name, schema_name, schema_name, schema_name);
+            WITH base_links AS (
+                SELECT
+                    l.link_id,
+                    l.a_node,
+                    l.b_node,
+                    l.length_m,
+                    l.geom,
+                    l.segment_objids,
+                    -- Aggregate route information (distinct values)
+                    array_agg(DISTINCT fi.rutenavn) FILTER (WHERE fi.rutenavn IS NOT NULL) as rutenavn_list,
+                    array_agg(DISTINCT fi.rutenummer) FILTER (WHERE fi.rutenummer IS NOT NULL) as rutenummer_list,
+                    array_agg(DISTINCT fi.vedlikeholdsansvarlig) FILTER (WHERE fi.vedlikeholdsansvarlig IS NOT NULL) as vedlikeholdsansvarlig_list,
+                    array_agg(DISTINCT fi.rutetype) FILTER (WHERE fi.rutetype IS NOT NULL) as rutetype_list
+                FROM %I.links l
+                LEFT JOIN LATERAL unnest(COALESCE(l.segment_objids, ARRAY[]::bigint[])) AS segment_objid ON true
+                LEFT JOIN %I.fotruteinfo fi ON fi.fotrute_fk = segment_objid
+                GROUP BY l.link_id, l.a_node, l.b_node, l.length_m, l.geom, l.segment_objids
+            )
+            SELECT 
+                bl.*,
+                -- route_geometries from route_continuous_geometries table (created by build-links)
+                (
+                    SELECT jsonb_object_agg(
+                        rcg.rutenummer::text,
+                        rcg.continuous_geometry
+                    )
+                    FROM %I.route_continuous_geometries rcg
+                    WHERE rcg.rutenummer = ANY(bl.rutenummer_list)
+                ) as route_geometries
+            FROM base_links bl;
+        ', schema_name, schema_name, schema_name, schema_name, schema_name, schema_name);
 
-        RAISE NOTICE 'Created view: %.links_with_routes', schema_name;
+        RAISE NOTICE 'Created view: %.links_with_routes (with continuous route geometry from materialized view)', schema_name;
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'Failed to create links_with_routes view: %', SQLERRM;
         RAISE NOTICE 'This is non-fatal - view will be skipped';
