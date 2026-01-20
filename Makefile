@@ -7,20 +7,12 @@ PGPORT ?= 5432
 PGUSER ?= stiflyt_updater
 PGADMIN_USER ?= postgres
 
-# OSM import performance optimizations
-# These can be overridden via environment variables or Makefile variables
-OSM_CACHE_MB ?= 8000
-OSM_NUM_PROCESSES ?= 4
-OSM_FLAT_NODES_DIR ?= ./data/flat_nodes
-OSM_FLAT_NODES_FILE ?= $(OSM_FLAT_NODES_DIR)/norway_flat_nodes.bin
-OSM_USE_SLIM ?= true
-
 # Virtual environment
 VENV := venv
 PYTHON := $(VENV)/bin/python3
 PIP := $(VENV)/bin/pip
 
-.PHONY: dependencies help create-db ensure-db drop-db load-dataset update-datasets db-status inspect-db run-migrations verify-migration build-links cron-update setup-roles fresh-start init-db refresh-db test show-pg-optimizations
+.PHONY: dependencies help create-db ensure-db drop-db load-dataset update-datasets db-status inspect-db run-migrations verify-migration build-links cron-update setup-roles fresh-start init-db refresh-db refresh-db-swap test
 
 help:
 	@echo "stiflyt-db Makefile"
@@ -33,20 +25,15 @@ help:
 	@echo "  make run-migrations Run SQL migrations"
 	@echo "  make fresh-start    Drop + recreate + load + migrate"
 	@echo "  make refresh-db     Reload data + migrations without drop"
+	@echo "  make refresh-db-swap Build new DB and swap names"
 	@echo "  make db-status      Health check"
 	@echo "  make inspect-db     Schema overview"
 	@echo "  make test           Run tests"
-	@echo "  make show-pg-optimizations  Show PostgreSQL optimization recommendations"
 	@echo ""
 	@echo "Variables:"
 	@echo "  PGDATABASE=$(PGDATABASE) PGHOST=$(PGHOST) PGPORT=$(PGPORT)"
 	@echo "  PGUSER=$(PGUSER) PGADMIN_USER=$(PGADMIN_USER)"
 	@echo ""
-	@echo "OSM Import Optimizations:"
-	@echo "  OSM_CACHE_MB=$(OSM_CACHE_MB) (osm2pgsql cache size in MB)"
-	@echo "  OSM_NUM_PROCESSES=$(OSM_NUM_PROCESSES) (parallel processes)"
-	@echo "  OSM_FLAT_NODES_FILE=$(OSM_FLAT_NODES_FILE) (flat nodes file path)"
-	@echo "  OSM_USE_SLIM=$(OSM_USE_SLIM) (use --slim mode: true/false)"
 
 # Install all required system dependencies (Ubuntu/Debian)
 dependencies:
@@ -76,11 +63,6 @@ dependencies:
 		python3-gdal \
 		> /dev/null 2>&1 || true
 	@echo "  ✓ GDAL installert"
-	@echo "==> Installerer osm2pgsql (for OSM import)..."
-	@sudo apt-get install -y \
-		osm2pgsql \
-		> /dev/null 2>&1 || true
-	@echo "  ✓ osm2pgsql installert"
 	@echo "==> Installerer Python verktøy..."
 	@sudo apt-get install -y \
 		python3 \
@@ -99,7 +81,6 @@ dependencies:
 	@echo "==> Verifiserer installasjoner..."
 	@command -v psql > /dev/null && echo "  ✓ psql funnet" || echo "  ✗ psql ikke funnet"
 	@command -v ogr2ogr > /dev/null && echo "  ✓ ogr2ogr funnet" || echo "  ✗ ogr2ogr ikke funnet"
-	@command -v osm2pgsql > /dev/null && echo "  ✓ osm2pgsql funnet" || echo "  ✗ osm2pgsql ikke funnet"
 	@command -v python3 > /dev/null && echo "  ✓ python3 funnet" || echo "  ✗ python3 ikke funnet"
 	@$(PYTHON) -c "import psycopg2" 2>/dev/null && echo "  ✓ psycopg2 installert" || echo "  ✗ psycopg2 ikke installert"
 	@$(PYTHON) -c "import yaml" 2>/dev/null && echo "  ✓ pyyaml installert" || echo "  ✗ pyyaml ikke installert"
@@ -233,6 +214,11 @@ refresh-db: $(VENV)
 	@echo ""
 	@PGUSER=stiflyt_updater $(MAKE) run-migrations
 
+# Refresh with DB name swap (build new DB, then swap names)
+refresh-db-swap: $(VENV)
+	@echo "==> Refresh swap: bygger ny database og bytter navn..."
+	@PGUSER=stiflyt_updater $(PYTHON) scripts/refresh_swap.py
+
 # Setup database roles and permissions (run once after create-db)
 # Requires superuser privileges - automatically tries as postgres if current user fails
 setup-roles:
@@ -288,31 +274,17 @@ drop-db:
 # Load any dataset (auto-detects PostGIS SQL or GML format)
 # Usage: make load-dataset ZIP_FILE=data/stedsnavn/file.zip TABLE=stedsnavn SRID=25833
 # Note: Uses stiflyt_updater by default (requires write permissions)
-# OSM imports automatically use optimized settings
 load-dataset: ensure-db $(VENV)
 	@if [ -z "$(ZIP_FILE)" ]; then \
 		echo "Feil: ZIP_FILE må angis. Eksempel: make load-dataset ZIP_FILE=data/stedsnavn/file.zip TABLE=stedsnavn"; \
 		exit 1; \
 	fi
-	@mkdir -p $(OSM_FLAT_NODES_DIR) || true
-	@OSM2PGSQL_ARGS="--cache $(OSM_CACHE_MB) --number-processes $(OSM_NUM_PROCESSES) --flat-nodes $(OSM_FLAT_NODES_FILE)" \
-		PGUSER=$${PGUSER:-stiflyt_updater} $(PYTHON) ./scripts/load_dataset.py "$(ZIP_FILE)" $(PGDATABASE) $(TABLE) $(SRID) --drop-tables
+	@PGUSER=$${PGUSER:-stiflyt_updater} $(PYTHON) ./scripts/load_dataset.py "$(ZIP_FILE)" $(PGDATABASE) $(TABLE) $(SRID) --drop-tables
 
 # Update all datasets from config file (cron-friendly)
 # This downloads updates and reloads data, replacing old tables
-# OSM imports are optimized with cache, parallel processing, and flat nodes
 update-datasets: $(VENV)
-	@echo "==> OSM import optimizations:"
-	@echo "  Cache: $(OSM_CACHE_MB)MB"
-	@echo "  Parallel processes: $(OSM_NUM_PROCESSES)"
-	@echo "  Flat nodes file: $(OSM_FLAT_NODES_FILE)"
-	@echo "  Use slim mode: $(OSM_USE_SLIM)"
-	@mkdir -p $(OSM_FLAT_NODES_DIR) || true
-	@# Note: Flat nodes file can be very large (18GB+ for Norway). If import fails with "Could not resize file",
-	@# try without flat nodes: OSM2PGSQL_ARGS="--cache $(OSM_CACHE_MB) --number-processes $(OSM_NUM_PROCESSES)" make update-datasets
-	@# Or try without slim mode: OSM_USE_SLIM=false make update-datasets
-	@OSM_USE_SLIM=$(OSM_USE_SLIM) OSM2PGSQL_ARGS="--cache $(OSM_CACHE_MB) --number-processes $(OSM_NUM_PROCESSES) --flat-nodes $(OSM_FLAT_NODES_FILE)" \
-		PGUSER=$${PGUSER:-stiflyt_updater} $(PYTHON) scripts/update_datasets.py $(or $(CONFIG_FILE),datasets.yaml) $(PGDATABASE)
+	@PGUSER=$${PGUSER:-stiflyt_updater} $(PYTHON) scripts/update_datasets.py $(or $(CONFIG_FILE),datasets.yaml) $(PGDATABASE)
 
 # Check database status and health
 db-status: $(VENV)
@@ -376,40 +348,3 @@ test: $(VENV)
 	@$(PIP) install -e ".[dev]" > /dev/null 2>&1
 	@$(VENV)/bin/python -m pytest tests/ -v
 
-# Show PostgreSQL optimization recommendations for OSM imports
-show-pg-optimizations:
-	@echo "==> PostgreSQL Optimization Recommendations for OSM Import"
-	@echo ""
-	@echo "For optimal OSM import performance, configure PostgreSQL with these settings:"
-	@echo ""
-	@echo "Add to postgresql.conf (typically /etc/postgresql/*/main/postgresql.conf):"
-	@echo ""
-	@echo "  # Memory settings for bulk operations"
-	@echo "  maintenance_work_mem = 1GB"
-	@echo "  work_mem = 256MB"
-	@echo ""
-	@echo "  # Checkpoint settings - spread checkpoints over longer period"
-	@echo "  checkpoint_completion_target = 0.9"
-	@echo "  max_wal_size = 2GB"
-	@echo "  checkpoint_timeout = 30min"
-	@echo ""
-	@echo "  # WAL settings for bulk writes"
-	@echo "  wal_buffers = 16MB"
-	@echo ""
-	@echo "  # Disable synchronous commit for faster writes (imports only)"
-	@echo "  synchronous_commit = off"
-	@echo ""
-	@echo "After making changes:"
-	@echo "  sudo systemctl reload postgresql"
-	@echo ""
-	@echo "See POSTGRESQL_CONF_OPTIMIZATIONS.md for detailed instructions."
-	@echo ""
-	@echo "Current OSM import settings:"
-	@echo "  Cache: $(OSM_CACHE_MB)MB"
-	@echo "  Parallel processes: $(OSM_NUM_PROCESSES)"
-	@echo "  Flat nodes file: $(OSM_FLAT_NODES_FILE)"
-	@echo "  Use slim mode: $(OSM_USE_SLIM)"
-	@echo ""
-	@echo "To customize, set environment variables:"
-	@echo "  OSM_CACHE_MB=8000 OSM_NUM_PROCESSES=4 make update-datasets"
-	@echo "  OSM_USE_SLIM=false make update-datasets  # Disable --slim mode (uses more RAM, may avoid temp table issues)"

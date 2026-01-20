@@ -58,7 +58,7 @@ def find_migration_files(migration_dir: Path) -> List[Path]:
 
 
 def check_links_table_exists(db_params: dict) -> bool:
-    """Check if links table exists in turrutebasen schema.
+    """Check if links table exists in the latest turrutebasen schema.
 
     Args:
         db_params: Database connection parameters
@@ -81,13 +81,22 @@ def check_links_table_exists(db_params: dict) -> bool:
         '-t',  # Tuples only (no headers)
         '-A',  # Unaligned output
         '-c', """
-            SELECT EXISTS (
-                SELECT 1
-                FROM information_schema.tables
-                WHERE table_schema LIKE 'turogfriluftsruter_%'
-                  AND table_name = 'links'
-                  AND table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
-            );
+            WITH latest_schema AS (
+                SELECT nspname
+                FROM pg_namespace
+                WHERE nspname LIKE 'turogfriluftsruter_%'
+                  AND nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
+                ORDER BY nspname DESC
+                LIMIT 1
+            )
+            SELECT COALESCE((
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables t
+                    JOIN latest_schema s ON t.table_schema = s.nspname
+                    WHERE t.table_name = 'links'
+                )
+            ), false);
         """
     ])
 
@@ -663,35 +672,6 @@ def check_owner_membership(db_params: dict) -> bool:
     return True
 
 
-def is_osm_enabled(project_root: Path) -> bool:
-    """Check if OSM is enabled in datasets.yaml.
-
-    Args:
-        project_root: Root directory of the project
-
-    Returns:
-        True if OSM dataset is enabled (uncommented), False otherwise
-    """
-
-    config_path = project_root / 'datasets.yaml'
-    if not config_path.exists():
-        return False
-
-    try:
-        configs = load_config(config_path)
-        if not isinstance(configs, list):
-            return False
-
-        # Check if any dataset has format: OSM (uncommented)
-        for cfg in configs:
-            if isinstance(cfg, dict) and cfg.get('format', '').upper() == 'OSM':
-                return True
-
-        return False
-    except Exception:
-        return False
-
-
 def main():
     """Main function."""
     parser = argparse.ArgumentParser(description='Run database migrations')
@@ -748,16 +728,11 @@ def main():
     #   003: add_link_ruteinfo_view (requires links)
     #   004: add_link_endpoint_names (requires links)
     #   005: create_stable_views (requires links)
-    #   006: create_osm_views (optional, requires OSM data)
     #   007: create_route_views (requires links)
-    
+
     migration_002 = next((f for f in migration_files if '002' in f.name), None)
     migration_003 = next((f for f in migration_files if '003' in f.name), None)
-    
-    # Check if OSM is enabled before running OSM migration
-    osm_enabled = is_osm_enabled(project_root)
-    migration_006 = next((f for f in migration_files if f.name.startswith('006_')), None)
-    
+
     # KRITISK: Check if spatial index exists on teig.omrade
     # Note: PostGIS typically creates this index automatically, but we verify it exists
     if not check_teig_omrade_spatial_index(db_params):
@@ -767,16 +742,13 @@ def main():
         print(f"     CREATE INDEX teig_omrade_gix ON <schema>.teig USING GIST (omrade);", file=sys.stderr)
     elif not args.quiet:
         print(f"  ✓ Spatial index eksisterer på teig.omrade (PostGIS oppretter automatisk)")
-    
-    if migration_006 and not osm_enabled and not args.quiet:
-        print(f"  ⊙ OSM er ikke aktivert i datasets.yaml - hopper over {migration_006.name}")
-    
+
     # Track which migrations have been run
     success_count = 0
     failed_count = 0
     failed_migrations = []
     migrations_run = []  # Not used in summary, but referenced in code
-    
+
     for migration_file in migration_files:
         # Run migration 002 first (build_topology)
         if migration_file == migration_002:
@@ -794,9 +766,9 @@ def main():
                     print(f"✗ Migrasjon feilet - stopper videre kjøring", file=sys.stderr)
                     print(f"  Feilet på: {migration_file.name}", file=sys.stderr)
                 break
-            
-            # After migration 002, run build-links if needed
-            if migration_003 and should_run_build_links(migration_003, db_params):
+
+            # After migration 002, always run build-links if migration 003 exists
+            if migration_003:
                 if not args.quiet:
                     print(f"  -> Kjører build-links (kreves etter migrasjon 002, før migrasjon 003)...")
                 if run_build_links(db_params, project_root, quiet=args.quiet or not args.verbose):
@@ -805,19 +777,12 @@ def main():
                 else:
                     print(f"     ✗ build-links feilet", file=sys.stderr)
                     print(f"     ⚠ KRITISK: Migrasjon 003 vil feile uten links-tabellen", file=sys.stderr)
-                    print(f"     ⚠ Migrasjoner vil fortsette, men views vil ikke bli opprettet", file=sys.stderr)
                     print(f"     ⚠ Kjør 'make build-links' manuelt og re-run migrasjoner", file=sys.stderr)
-                    # Continue anyway - migration 003 will handle the error gracefully
+                    sys.exit(1)
             elif migration_003 and not args.quiet:
-                print(f"  ⊙ build-links ikke nødvendig (links-tabellen eksisterer allerede)")
-            
+                print(f"  ⊙ build-links hoppet over (ingen migrasjon 003 funnet)")
+
             continue  # Skip normal migration handling for 002 (already handled)
-        
-        # Skip OSM migration (006) if OSM is not enabled
-        if migration_file == migration_006 and not osm_enabled:
-            if not args.quiet:
-                print(f"  ⊙ Hoppet over {migration_file.name} (OSM ikke aktivert)")
-            continue
 
         # Run other migrations normally
         if run_migration(db_params, migration_file, verbose=args.verbose, quiet=args.quiet):

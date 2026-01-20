@@ -69,7 +69,7 @@ make dependencies
 ```
 
 This automatically:
-- Installs PostgreSQL, PostGIS, GDAL, osm2pgsql, and Python packages
+- Installs PostgreSQL, PostGIS, GDAL, and Python packages
 - Creates a virtual environment (`venv/`)
 - Installs Python dependencies
 
@@ -82,7 +82,6 @@ sudo apt-get install -y \
     postgis \
     postgresql-postgis \
     gdal-bin \
-    osm2pgsql \
     python3-gdal \
     python3 \
     python3-pip \

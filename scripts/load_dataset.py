@@ -15,11 +15,6 @@ Environment variables:
     PGPASSWORD   - PostgreSQL password (if needed)
     PGDATABASE   - Database name (can also be passed as argument)
     TARGET_SRID  - Target SRID for transformation (default: 25833)
-    OSM2PGSQL_ARGS    - Extra osm2pgsql args (e.g. "--hstore --cache 8000")
-    OSM2PGSQL_SCHEMA  - Target schema for osm2pgsql (default: public)
-    OSM2PGSQL_PREFIX  - Table prefix for osm2pgsql (default: planet_osm)
-    OSM2PGSQL_STYLE   - Path to osm2pgsql style file (optional)
-    OSM_USE_SLIM      - Use --slim mode (default: true). Set to false to avoid temp table issues
 """
 
 import os
@@ -28,7 +23,6 @@ import zipfile
 import subprocess
 import re
 import argparse
-import shlex
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -75,11 +69,6 @@ def detect_format(extract_dir: Path) -> Tuple[str, List[Path]]:
     if gdb_dirs:
         return ('FGDB', sorted(gdb_dirs))
 
-    # Check for OSM PBF files
-    osm_files = list(extract_dir.rglob('*.osm.pbf'))
-    if osm_files:
-        return ('OSM', osm_files)
-
     # Could not detect format
     return (None, [])
 
@@ -96,8 +85,6 @@ def detect_format_from_zip(zip_path: Path) -> Tuple[Optional[str], List[str]]:
     sql_files = []
     gml_files = []
     gdb_entries = []
-    osm_files = []
-
     try:
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             for name in zip_ref.namelist():
@@ -107,12 +94,7 @@ def detect_format_from_zip(zip_path: Path) -> Tuple[Optional[str], List[str]]:
                     gml_files.append(name)
                 elif '.gdb/' in name or name.endswith('.gdbtable'):
                     gdb_entries.append(name)
-                elif name.endswith('.osm.pbf'):
-                    osm_files.append(name)
     except zipfile.BadZipFile:
-        # Check if it's a standalone OSM PBF file (not a ZIP)
-        if zip_path.suffixes == ['.osm', '.pbf'] or zip_path.name.endswith('.osm.pbf'):
-            return ('OSM', [str(zip_path)])
         return None, []
 
     if sql_files:
@@ -121,12 +103,7 @@ def detect_format_from_zip(zip_path: Path) -> Tuple[Optional[str], List[str]]:
         return ('GML', gml_files)
     elif gdb_entries:
         return ('FGDB', gdb_entries)
-    elif osm_files:
-        return ('OSM', osm_files)
     else:
-        # Check if the file itself is an OSM PBF (not a ZIP)
-        if zip_path.suffixes == ['.osm', '.pbf'] or zip_path.name.endswith('.osm.pbf'):
-            return ('OSM', [str(zip_path)])
         return None, []
 
 
@@ -996,13 +973,13 @@ def filter_to_dnt_routes(db_params: dict, schema_prefix: Optional[str]) -> bool:
     print(f"  -> Filtrerer til DNT-ruter i schema {schema_name}...")
     
     # Filter fotruteinfo and fotrute to only DNT routes
-    # DNT routes typically have vedlikeholdsansvarlig = 'DNT' or rutenummer starting with 'bre', 'jot', 'ron', etc.
+    # Keep any rows where vedlikeholdsansvarlig contains "DNT" (case-insensitive).
     filter_sql = f"""
     {role_preamble_sql()}
     -- Delete fotruteinfo rows that don't belong to DNT routes
     DELETE FROM {schema_name}.fotruteinfo
-    WHERE vedlikeholdsansvarlig != 'DNT'
-       AND NOT (rutenummer LIKE 'bre%' OR rutenummer LIKE 'jot%' OR rutenummer LIKE 'ron%');
+    WHERE vedlikeholdsansvarlig IS NULL
+       OR vedlikeholdsansvarlig NOT ILIKE '%DNT%';
     
     -- Delete fotrute segments that don't have any fotruteinfo (orphaned segments)
     DELETE FROM {schema_name}.fotrute
@@ -1176,15 +1153,6 @@ def check_ogr2ogr() -> bool:
     """Check if ogr2ogr is available."""
     try:
         subprocess.run(['ogr2ogr', '--version'], capture_output=True, check=True)
-        return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
-
-
-def check_osm2pgsql() -> bool:
-    """Check if osm2pgsql is available."""
-    try:
-        subprocess.run(['osm2pgsql', '--version'], capture_output=True, check=True)
         return True
     except (FileNotFoundError, subprocess.CalledProcessError):
         return False
@@ -1775,312 +1743,6 @@ def load_fgdb(db_params: dict, gdb_dirs: List[Path], target_srid: Optional[int],
     return success_count > 0
 
 
-def load_osm_pbf(
-    db_params: dict,
-    osm_file: Path,
-    target_srid: Optional[int],
-    staging_schema: Optional[str],
-    drop_tables: bool = False
-) -> bool:
-    """Load OSM PBF file using osm2pgsql.
-
-    Args:
-        db_params: Database connection parameters
-        osm_file: Path to OSM PBF file
-        target_srid: Target SRID for transformation
-        staging_schema: Schema name for staging (or None for public)
-        drop_tables: If True, drop existing tables before loading
-    """
-    if not check_osm2pgsql():
-        print("Feil: osm2pgsql ikke funnet. Installer osm2pgsql:", file=sys.stderr)
-        print("  Ubuntu/Debian: sudo apt-get install osm2pgsql", file=sys.stderr)
-        print("  macOS: brew install osm2pgsql", file=sys.stderr)
-        return False
-
-    env = os.environ.copy()
-    if db_params.get('password'):
-        env['PGPASSWORD'] = db_params['password']
-
-    schema = staging_schema or os.environ.get('OSM2PGSQL_SCHEMA', 'public')
-    prefix = os.environ.get('OSM2PGSQL_PREFIX', 'planet_osm')
-    style = os.environ.get('OSM2PGSQL_STYLE')
-    extra_args = shlex.split(os.environ.get('OSM2PGSQL_ARGS', ''))
-
-    # Clean up staging schema if it exists (from previous failed/aborted imports)
-    if staging_schema:
-        print(f"  -> Rydder opp i staging schema {staging_schema} (hvis eksisterer)...")
-        drop_schema_sql = f"DROP SCHEMA IF EXISTS {staging_schema} CASCADE;"
-        try:
-            drop_cmd = ['psql']
-            if db_params.get('host'):
-                drop_cmd.extend(['-h', db_params['host']])
-            if db_params.get('port'):
-                drop_cmd.extend(['-p', str(db_params['port'])])
-            drop_cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q', '-c', drop_schema_sql])
-            subprocess.run(drop_cmd, env=env, capture_output=True, check=False)
-            print("     ✓ Staging schema ryddet")
-        except Exception as e:
-            print(f"     ⚠ Kunne ikke rydde staging schema (fortsetter): {e}")
-
-        # Create staging schema for fresh import
-        print(f"  -> Oppretter staging schema {staging_schema}...")
-        if not ensure_schema_exists(db_params, staging_schema):
-            print("     ✗ Kunne ikke opprette staging schema", file=sys.stderr)
-            return False
-        print("     ✓ Staging schema opprettet")
-
-    print(f"  -> Laster {osm_file.name} (OSM PBF) med osm2pgsql ...")
-
-    cmd = [
-        'osm2pgsql',
-    ]
-
-    # Add --slim flag only if OSM_USE_SLIM is set to true (default: true)
-    # Without --slim, osm2pgsql uses more RAM but avoids temp table issues
-    use_slim = os.environ.get('OSM_USE_SLIM', 'true').lower() in ('true', '1', 'yes', 'on')
-    if use_slim:
-        cmd.append('--slim')
-
-    cmd.extend([
-        '--schema', schema,
-        '--prefix', prefix,
-        '-d', db_params['database'],
-        '-U', db_params['user']
-    ])
-
-    if db_params.get('host'):
-        cmd.extend(['-H', db_params['host']])
-    if db_params.get('port'):
-        cmd.extend(['-P', str(db_params['port'])])
-
-    cmd.append('--create')
-    if drop_tables:
-        cmd.append('--drop')
-
-    if style:
-        cmd.extend(['--style', style])
-
-    cmd.extend(extra_args)
-
-    # Add --log-progress flag if not already present in extra_args
-    # osm2pgsql uses --log-progress, not --progress
-    if '--log-progress' not in extra_args and '--progress' not in extra_args:
-        cmd.extend(['--log-progress', 'true'])
-
-    cmd.append(str(osm_file))
-
-    process = None
-    try:
-        # Use Popen for real-time progress output
-        process = subprocess.Popen(
-            cmd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,  # Combine stderr with stdout
-            text=True,
-            bufsize=1,  # Line buffered
-            universal_newlines=True
-        )
-
-        # Read and print output line by line for real-time progress
-        import threading
-        import time
-
-        last_progress_line = ""
-        error_lines = []
-        line_count = 0
-        has_output = False
-
-        # Show a heartbeat indicator if no progress messages appear
-        heartbeat_counter = [0]  # Use list to allow modification from inner function
-
-        def show_heartbeat():
-            """Show heartbeat while waiting for output."""
-            time.sleep(2)  # Wait 2 seconds before showing heartbeat
-            while process.poll() is None:
-                heartbeat_counter[0] += 1
-                dots = "." * (heartbeat_counter[0] % 4)  # Rotating dots
-                print(f"\r     ⏳ Importerer{dots}", end='', flush=True)
-                time.sleep(1)
-
-        heartbeat_thread = threading.Thread(target=show_heartbeat, daemon=True)
-        heartbeat_thread.start()
-
-        # Read output line by line
-        for line in process.stdout:
-            line = line.rstrip()
-            if not line:
-                continue
-
-            line_count += 1
-            has_output = True
-            heartbeat_counter[0] = -1  # Stop heartbeat
-
-            # Filter and format osm2pgsql progress messages
-            # osm2pgsql outputs various messages - show the important ones
-            is_progress = (
-                'Reading in file' in line or
-                'Processing' in line or
-                'Node stats' in line or
-                'Way stats' in line or
-                'Relation stats' in line or
-                'Stopped table' in line or
-                'Copying' in line or
-                'Committing transaction' in line or
-                'Creating indexes' in line or
-                'Completed' in line
-            )
-
-            if is_progress:
-                # Clean up the progress line for better display
-                # osm2pgsql progress format: "Processing: Node(123456) Way(78901) Relation(1234)"
-                progress_msg = line
-                # Remove verbose prefixes if present
-                if 'Processing:' in progress_msg:
-                    progress_msg = progress_msg.replace('Processing:', 'Behandler:')
-                elif 'Reading in file:' in progress_msg:
-                    progress_msg = progress_msg.replace('Reading in file:', 'Leser fil:')
-                elif 'Node stats:' in progress_msg or 'Way stats:' in progress_msg or 'Relation stats:' in progress_msg:
-                    progress_msg = progress_msg.replace('Node stats:', 'Noder:').replace('Way stats:', 'Veier:').replace('Relation stats:', 'Relasjoner:')
-                elif 'Creating indexes' in progress_msg:
-                    progress_msg = progress_msg.replace('Creating indexes', 'Oppretter indekser')
-                elif 'Completed' in progress_msg:
-                    progress_msg = progress_msg.replace('Completed', 'Fullført')
-
-                # Print progress on same line (overwrite previous)
-                print(f"\r     {progress_msg}", end='', flush=True)
-                last_progress_line = progress_msg
-            elif 'ERROR' in line or 'FATAL' in line or 'Error' in line:
-                error_lines.append(line)
-                print(f"\n     ⚠ {line}", file=sys.stderr)
-            elif 'WARNING' in line or 'Warning' in line:
-                # Show warnings but don't clutter output
-                if 'disk I/O' not in line.lower() and 'checkpoint' not in line.lower():
-                    print(f"\n     ⚠ {line}", file=sys.stderr)
-
-        # Wait for process to complete
-        returncode = process.wait()
-
-        # Clear the progress line
-        if has_output:
-            print()  # New line after progress
-
-        if returncode == 0:
-            print(f"     ✓ Lastet")
-
-            # Set ownership and convert unlogged tables to logged after import
-            if staging_schema:
-                print("  -> Setter eierskap til stiflyt_owner...")
-                try:
-                    owner_cmd = ['psql']
-                    if db_params.get('host'):
-                        owner_cmd.extend(['-h', db_params['host']])
-                    if db_params.get('port'):
-                        owner_cmd.extend(['-p', str(db_params['port'])])
-                    owner_cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q', '-c',
-                        f"""
-                        DO $$
-                        BEGIN
-                            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_owner') THEN
-                                BEGIN
-                                    EXECUTE 'SET ROLE stiflyt_owner';
-                                EXCEPTION WHEN insufficient_privilege THEN
-                                    RAISE NOTICE 'Could not SET ROLE stiflyt_owner (not member)';
-                                END;
-                            END IF;
-                        END $$;
-
-                        DO $$
-                        DECLARE
-                            r record;
-                        BEGIN
-                            -- Set ownership of all tables
-                            FOR r IN
-                                SELECT tablename
-                                FROM pg_tables
-                                WHERE schemaname = '{staging_schema}'
-                            LOOP
-                                BEGIN
-                                    EXECUTE format('ALTER TABLE %I.%I OWNER TO stiflyt_owner', '{staging_schema}', r.tablename);
-                                EXCEPTION WHEN OTHERS THEN
-                                    RAISE NOTICE 'Could not set owner for table %.%: %', '{staging_schema}', r.tablename, SQLERRM;
-                                END;
-                            END LOOP;
-
-                            -- Set ownership of all sequences
-                            FOR r IN
-                                SELECT sequence_name
-                                FROM information_schema.sequences
-                                WHERE sequence_schema = '{staging_schema}'
-                            LOOP
-                                BEGIN
-                                    EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO stiflyt_owner', '{staging_schema}', r.sequence_name);
-                                EXCEPTION WHEN OTHERS THEN
-                                    RAISE NOTICE 'Could not set owner for sequence %.%: %', '{staging_schema}', r.sequence_name, SQLERRM;
-                                END;
-                            END LOOP;
-                        END $$;
-
-                        RESET ROLE;
-                        """])
-                    subprocess.run(owner_cmd, env=env, capture_output=True, check=False)
-                    print("     ✓ Eierskap satt")
-                except Exception as e:
-                    print(f"     ⚠ Kunne ikke sette eierskap (fortsetter): {e}")
-
-                print("  -> Konverterer unlogged tables til logged...")
-                try:
-                    convert_cmd = ['psql']
-                    if db_params.get('host'):
-                        convert_cmd.extend(['-h', db_params['host']])
-                    if db_params.get('port'):
-                        convert_cmd.extend(['-p', str(db_params['port'])])
-                    convert_cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q', '-c',
-                        f"""
-                        DO $$
-                        DECLARE
-                            r record;
-                        BEGIN
-                            FOR r IN
-                                SELECT tablename
-                                FROM pg_tables
-                                WHERE schemaname = '{staging_schema}'
-                            LOOP
-                                EXECUTE format('ALTER TABLE %I.%I SET LOGGED', '{staging_schema}', r.tablename);
-                            END LOOP;
-                        END $$;
-                        """])
-                    subprocess.run(convert_cmd, env=env, capture_output=True, check=False)
-                    print("     ✓ Tables konvertert til logged")
-                except Exception as e:
-                    print(f"     ⚠ Kunne ikke konvertere tables (fortsetter): {e}")
-
-                print("  -> Bygger spatial-indekser (dette kan ta noen minutter)...")
-                if create_missing_spatial_indexes(db_params, schemas=[staging_schema]):
-                    print("     ✓ Indekser bygget")
-                else:
-                    print("     ⚠ Kunne ikke bygge alle indekser (kan bygges manuelt senere)")
-
-            return True
-        else:
-            # Show accumulated error lines
-            if error_lines:
-                print(f"     ✗ Feil under import:", file=sys.stderr)
-                for err_line in error_lines[-5:]:  # Show last 5 error lines
-                    print(f"       {err_line}", file=sys.stderr)
-            else:
-                print(f"     ✗ Import feilet med returkode {returncode}", file=sys.stderr)
-            return False
-    except FileNotFoundError:
-        print("     ✗ osm2pgsql ikke funnet", file=sys.stderr)
-        return False
-    except Exception as e:
-        print(f"     ✗ Uventet feil: {e}", file=sys.stderr)
-        if process and process.poll() is None:
-            process.kill()
-        return False
-
-
 def load_dataset(
     zip_path: Path,
     database: str,
@@ -2093,7 +1755,7 @@ def load_dataset(
     """Load dataset from ZIP file or standalone file into PostGIS database.
 
     Args:
-        zip_path: Path to ZIP file or standalone file (e.g., .osm.pbf)
+        zip_path: Path to ZIP file
         database: Database name
         table_name: Table name (required for GML, auto-detected for PostGIS SQL)
         target_srid: Target SRID for transformation (default: 25833)
@@ -2127,30 +1789,6 @@ def load_dataset(
         target_srid = int(os.environ.get('TARGET_SRID', '25833'))
     if table_name is None:
         table_name = zip_path.stem.lower().replace('-', '_')
-
-    # Check if this is a standalone OSM PBF file (not a ZIP)
-    if zip_path.suffixes == ['.osm', '.pbf'] or zip_path.name.endswith('.osm.pbf'):
-        print(f"==> Detektert OSM PBF fil: {zip_path.name}")
-        print(f"==> Sjekker PostGIS extension i database '{db_params['database']}' ...")
-        if not ensure_postgis_extension(db_params):
-            return False
-        print("  ✓ PostGIS extension klar")
-
-        staging_schema = f"staging_{sanitize_identifier(table_name)}"
-        if not ensure_schema_exists(db_params, staging_schema):
-            return False
-
-        if load_osm_pbf(db_params, zip_path, target_srid, staging_schema, drop_tables):
-            print(f"==> Ferdig. OSM PBF fil lastet inn")
-            print(f"==> Flytter staging-schema {staging_schema} til public ...")
-            move_schema_objects(db_params, staging_schema, 'public')
-            grant_privileges_for_schema(db_params, 'public')
-            print("==> Bygger manglende spatial-indekser ...")
-            create_missing_spatial_indexes(db_params)
-            analyze_tables(db_params, schemas=['public'])
-            return True
-        else:
-            return False
 
     # Try streaming first (no extraction)
     if stream:
@@ -2226,9 +1864,6 @@ def load_dataset(
             elif format_type == 'FGDB':
                 print("  ℹ FGDB oppdaget. Streaming støttes ikke, prøver med ekstraksjon ...")
                 # fall through to extraction
-            elif format_type == 'OSM':
-                print("  ℹ OSM PBF oppdaget i ZIP. Prøver med ekstraksjon ...")
-                # fall through to extraction
 
     # Fallback: Extract ZIP file (original method)
     extract_dir = zip_path.parent / f"{zip_path.stem}_extracted"
@@ -2242,7 +1877,7 @@ def load_dataset(
 
         if not format_type:
             print(f"Feil: Kunne ikke detektere format i {zip_path}", file=sys.stderr)
-            print("Forventet SQL (.sql), GML (.gml), FileGDB (.gdb) eller OSM PBF (.osm.pbf)", file=sys.stderr)
+            print("Forventet SQL (.sql), GML (.gml) eller FileGDB (.gdb)", file=sys.stderr)
             return False
 
         print(f"  ✓ Detektert format: {format_type}")
@@ -2257,11 +1892,6 @@ def load_dataset(
             staging_schema = f"staging_{sanitize_identifier(zip_path.stem)}"
             if not ensure_schema_exists(db_params, staging_schema):
                 return False
-        elif format_type == 'OSM':
-            staging_schema = f"staging_{sanitize_identifier(table_name)}"
-            if not ensure_schema_exists(db_params, staging_schema):
-                return False
-
         # Ensure PostGIS extension
         print(f"==> Sjekker PostGIS extension i database '{db_params['database']}' ...")
         if not ensure_postgis_extension(db_params):
@@ -2328,27 +1958,6 @@ def load_dataset(
                 return True
             else:
                 print("Feil: Kunne ikke laste inn FGDB", file=sys.stderr)
-                return False
-
-        elif format_type == 'OSM':
-            if len(files) > 0:
-                # Use first OSM file (typically only one)
-                osm_file = files[0]
-                if load_osm_pbf(db_params, osm_file, target_srid, staging_schema, drop_tables):
-                    print(f"==> Ferdig. OSM PBF fil lastet inn")
-                    if staging_schema:
-                        print(f"==> Flytter staging-schema {staging_schema} til public ...")
-                        move_schema_objects(db_params, staging_schema, 'public')
-                        grant_privileges_for_schema(db_params, 'public')
-                    print("==> Bygger manglende spatial-indekser ...")
-                    create_missing_spatial_indexes(db_params)
-                    analyze_tables(db_params, schemas=['public'])
-                    return True
-                else:
-                    print("Feil: Kunne ikke laste inn OSM PBF", file=sys.stderr)
-                    return False
-            else:
-                print("Feil: Ingen OSM PBF filer funnet", file=sys.stderr)
                 return False
 
         return False

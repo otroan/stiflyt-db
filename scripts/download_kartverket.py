@@ -969,7 +969,7 @@ def download_single_dataset(dataset_config: Dict[str, Any], index: int, total: i
     area_type = dataset_config.get('area_type', '')
     output_dir = dataset_config.get('output_dir', f'./data/{name}')
     feed_url_override = dataset_config.get('feed_url', None)
-    download_url = dataset_config.get('download_url', None)  # Direct download URL for OSM
+    download_url = dataset_config.get('download_url', None)
 
     # Thread-safe print
     print_lock = threading.Lock()
@@ -977,46 +977,16 @@ def download_single_dataset(dataset_config: Dict[str, Any], index: int, total: i
         print(f"[{index}/{total}] {name}")
         print(f"  Dataset: {dataset_name}")
         print(f"  Format: {format_pref}")
-        if format_pref != 'OSM':
-            print(f"  UTM Zone: {utm_zone}")
-            print(f"  Area Filter: {area_filter}")
-            if area_type:
-                print(f"  Area Type: {area_type}")
+        print(f"  UTM Zone: {utm_zone}")
+        print(f"  Area Filter: {area_filter}")
+        if area_type:
+            print(f"  Area Type: {area_type}")
         if download_url:
             print(f"  Download URL: {download_url}")
         print(f"  Output: {output_dir}")
         print()
 
     try:
-        # Handle OSM format with direct download URL
-        if format_pref == 'OSM' and download_url:
-            # Create output directory
-            outdir = Path(output_dir)
-            outdir.mkdir(parents=True, exist_ok=True)
-
-            # Generate filename from URL
-            filename = os.path.basename(urllib.parse.urlparse(download_url).path)
-            if not filename or filename == "/":
-                filename = f"{name}.osm.pbf"
-
-            output_path = outdir / filename
-
-            # Check if file already exists
-            if output_path.exists():
-                with print_lock:
-                    print(f"  ⊙ {filename} (eksisterer, verifiserer ...)")
-                    # For OSM, we can check file size or modification time
-                    # Simple check: if file exists and is > 0, assume it's valid
-                    if output_path.stat().st_size > 0:
-                        file_size = format_size(output_path.stat().st_size)
-                        print(f"     ✓ Fil eksisterer ({file_size})")
-                        return (name, True, 1, None)
-                    else:
-                        print("     ⊙ Fil er tom, laster ned på nytt ...")
-                        output_path.unlink()
-
-            with print_lock:
-                print(f"  -> {filename}")
 
             if download_file(download_url, output_path):
                 file_size = format_size(output_path.stat().st_size)
