@@ -42,6 +42,17 @@ def _get_turrutebasen_schema(conn):
         return result[0] if result else None
 
 
+def _print_sample_rows(cur, label: str, sql: str, params=None) -> None:
+    cur.execute(sql, params or ())
+    rows = cur.fetchall()
+    if not rows:
+        print(f"[debug] {label}: no rows")
+        return
+    print(f"[debug] {label}:")
+    for row in rows:
+        print(f"  {row}")
+
+
 @pytest.mark.integration
 def test_node_names_view_exists():
     """Test that node_names materialized view exists after migration 004."""
@@ -279,6 +290,30 @@ def test_anchor_nodes_has_names():
                 assert with_names > 0, \
                     f"Expected at least some anchor_nodes to have names from ruteinfopunkt/stedsnavn, " \
                     f"but all {total} entries have navn_kilde='koordinat'"
+
+            _print_sample_rows(
+                cur,
+                "anchor_nodes name samples",
+                f"""
+                SELECT node_id, navn, navn_kilde, navn_distance_m
+                FROM {schema}.anchor_nodes
+                WHERE navn IS NOT NULL
+                ORDER BY navn_distance_m NULLS LAST
+                LIMIT 5
+                """
+            )
+
+            _print_sample_rows(
+                cur,
+                "node_names samples",
+                f"""
+                SELECT node_id, navn, navn_kilde, distance_m
+                FROM {schema}.node_names
+                WHERE navn IS NOT NULL
+                ORDER BY distance_m NULLS LAST
+                LIMIT 5
+                """
+            )
     finally:
         conn.close()
 
