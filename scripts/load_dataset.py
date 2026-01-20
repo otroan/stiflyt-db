@@ -551,7 +551,7 @@ def ensure_schema_exists(db_params: dict, schema: str) -> bool:
 def grant_privileges_for_schema_prefix(db_params: dict, schema_prefix: Optional[str]) -> bool:
     """Grant privileges for all schemas matching a prefix.
 
-    Uses grant_schema_privileges_for_prefix() (created by migration 000_setup_roles.sql).
+    Uses grant_schema_privileges() to avoid search_path issues in helper function.
     """
     if not schema_prefix:
         return True
@@ -570,7 +570,22 @@ def grant_privileges_for_schema_prefix(db_params: dict, schema_prefix: Optional[
     prefix_literal = schema_prefix.replace("'", "''")
     sql = f"""
     {role_preamble_sql()}
-    SELECT grant_schema_privileges_for_prefix('{prefix_literal}');
+    DO $$
+    DECLARE
+        schema_prefix TEXT := '{prefix_literal}';
+        schema_rec RECORD;
+    BEGIN
+        FOR schema_rec IN
+            SELECT nspname
+            FROM pg_namespace
+            WHERE nspname LIKE schema_prefix || '_%'
+              AND nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
+              AND nspname NOT LIKE 'pg_temp_%'
+              AND nspname NOT LIKE 'pg_toast_temp_%'
+        LOOP
+            PERFORM public.grant_schema_privileges(schema_rec.nspname);
+        END LOOP;
+    END $$;
     {role_reset_sql()}
     """
 
@@ -921,26 +936,26 @@ def extract_table_names_from_zip_sql(zip_path: Path, sql_file_in_zip: str) -> Tu
 
 def filter_to_dnt_routes(db_params: dict, schema_prefix: Optional[str]) -> bool:
     """Filter imported data to only DNT routes if DEV_FILTER_DNT is set.
-    
+
     Deletes fotruteinfo and fotrute rows that don't belong to DNT routes.
     """
     dev_filter = os.environ.get('DEV_FILTER_DNT', '').lower() in ('true', '1', 'yes', 'on')
     if not dev_filter:
         return True  # No filtering needed
-    
+
     print("  ℹ DEV_FILTER_DNT er aktivert - filtrerer til DNT-ruter...")
-    
+
     env = os.environ.copy()
     if db_params.get('password'):
         env['PGPASSWORD'] = db_params['password']
-    
+
     cmd = ['psql', '-v', 'ON_ERROR_STOP=1']
     if db_params.get('host'):
         cmd.extend(['-h', db_params['host']])
     if db_params.get('port'):
         cmd.extend(['-p', str(db_params['port'])])
     cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q'])
-    
+
     if schema_prefix:
         # Find the actual schema name
         find_schema_sql = f"""
@@ -969,9 +984,9 @@ def filter_to_dnt_routes(db_params: dict, schema_prefix: Optional[str]) -> bool:
     else:
         print("  ⚠ Kunne ikke finne schema prefix for filtrering", file=sys.stderr)
         return True
-    
+
     print(f"  -> Filtrerer til DNT-ruter i schema {schema_name}...")
-    
+
     # Filter fotruteinfo and fotrute to only DNT routes
     # Keep any rows where vedlikeholdsansvarlig contains "DNT" (case-insensitive).
     filter_sql = f"""
@@ -980,11 +995,11 @@ def filter_to_dnt_routes(db_params: dict, schema_prefix: Optional[str]) -> bool:
     DELETE FROM {schema_name}.fotruteinfo
     WHERE vedlikeholdsansvarlig IS NULL
        OR vedlikeholdsansvarlig NOT ILIKE '%DNT%';
-    
+
     -- Delete fotrute segments that don't have any fotruteinfo (orphaned segments)
     DELETE FROM {schema_name}.fotrute
     WHERE objid NOT IN (SELECT DISTINCT fotrute_fk FROM {schema_name}.fotruteinfo WHERE fotrute_fk IS NOT NULL);
-    
+
     -- Clean up orphaned nodes (nodes not referenced by any remaining segments)
     DELETE FROM {schema_name}.nodes
     WHERE node_id NOT IN (
@@ -992,10 +1007,10 @@ def filter_to_dnt_routes(db_params: dict, schema_prefix: Optional[str]) -> bool:
         UNION
         SELECT DISTINCT target_node FROM {schema_name}.fotrute WHERE target_node IS NOT NULL
     );
-    
+
     {role_reset_sql()}
     """
-    
+
     try:
         result = subprocess.run(
             cmd,
@@ -1823,11 +1838,11 @@ def load_dataset(
                     print(f"==> Ferdig. {len(files_in_zip)} SQL-fil(er) lastet inn (uten ekstraksjon)")
                     # Extract schema prefix to analyze imported tables
                     table_names, schema_prefix = extract_table_names_from_zip_sql(zip_path, files_in_zip[0])
-                    
+
                     # Filter to DNT routes if DEV_FILTER_DNT is set
                     if schema_prefix:
                         filter_to_dnt_routes(db_params, schema_prefix)
-                    
+
                     if schema_prefix:
                         grant_privileges_for_schema_prefix(db_params, schema_prefix)
                     else:
@@ -1906,11 +1921,11 @@ def load_dataset(
                 print(f"==> Ferdig. {len(files)} SQL-fil(er) lastet inn")
                 # Extract table names from first SQL file
                 table_names, schema_prefix = extract_table_names_from_sql(files[0])
-                
+
                 # Filter to DNT routes if DEV_FILTER_DNT is set
                 if schema_prefix:
                     filter_to_dnt_routes(db_params, schema_prefix)
-                
+
                 if schema_prefix:
                     grant_privileges_for_schema_prefix(db_params, schema_prefix)
                 else:

@@ -88,6 +88,13 @@ Includes views for:
 - Matrikkel tables (if present).
 - Stedsnavn tables from `public`.
 
+### `006_add_static_indexes.sql`
+
+Adds spatial GIST indexes for static datasets:
+
+- `matrikkeleneiendomskartteig_*.teig(<geom>)`
+- `public.sted_posisjon(<geom>)`
+
 ## Troubleshooting
 
 - Run migrations manually with increased verbosity: `make run-migrations`.

@@ -209,6 +209,68 @@ def test_route_lookup_by_rutenummer():
 
 
 @pytest.mark.integration
+def test_fotrute_spatial_lookup():
+    """Basic spatial lookup on stiflyt.fotrute."""
+    db_params = load_dataset.get_db_connection_params()
+    if not db_params.get("database"):
+        pytest.skip("PGDATABASE not set")
+
+    conn = psycopg2.connect(**_connection_kwargs(db_params))
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT senterlinje
+                FROM stiflyt.fotrute
+                WHERE senterlinje IS NOT NULL
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+            if not row:
+                pytest.skip("No fotrute geometries found")
+
+            cur.execute("""
+                SELECT ST_DWithin(senterlinje, ST_PointOnSurface(senterlinje), 0)
+                FROM stiflyt.fotrute
+                WHERE senterlinje IS NOT NULL
+                LIMIT 1
+            """)
+            assert cur.fetchone()[0] is True
+    finally:
+        conn.close()
+
+
+@pytest.mark.integration
+def test_fotruteinfo_lookup_by_rutenummer():
+    """Lookup in stiflyt.fotruteinfo by rutenummer."""
+    db_params = load_dataset.get_db_connection_params()
+    if not db_params.get("database"):
+        pytest.skip("PGDATABASE not set")
+
+    conn = psycopg2.connect(**_connection_kwargs(db_params))
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT rutenummer
+                FROM stiflyt.fotruteinfo
+                WHERE rutenummer IS NOT NULL
+                LIMIT 1
+            """)
+            row = cur.fetchone()
+            if not row:
+                pytest.skip("No rutenummer found in fotruteinfo")
+
+            rutenummer = row[0]
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM stiflyt.fotruteinfo
+                WHERE rutenummer = %s
+            """, (rutenummer,))
+            assert cur.fetchone()[0] > 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.integration
 def test_route_listing():
     """Test that we can list all routes."""
     db_params = load_dataset.get_db_connection_params()

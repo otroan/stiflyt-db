@@ -243,6 +243,39 @@ BEGIN
                 RAISE NOTICE 'Table %.% does not exist, skipping', matrikkel_schema, tbl_name;
             END IF;
         END LOOP;
+    ELSE
+        -- Fallback to static_foreign schema if present (from static DB)
+        IF EXISTS (
+            SELECT 1
+            FROM information_schema.tables t
+            WHERE t.table_schema = 'static_foreign'
+              AND t.table_name = 'teig'
+        ) THEN
+            FOR tbl_name IN
+                SELECT unnest(ARRAY[
+                    'teig',
+                    'matrikkelenhet',
+                    'eiendomsgrense',
+                    'teiggrensepunkt'
+                ])
+            LOOP
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables t
+                    WHERE t.table_schema = 'static_foreign'
+                      AND t.table_name = tbl_name
+                ) INTO view_exists;
+
+                IF view_exists THEN
+                    EXECUTE format('DROP VIEW IF EXISTS %I.%I CASCADE', view_schema, tbl_name);
+                    EXECUTE format('CREATE VIEW %I.%I AS SELECT * FROM static_foreign.%I',
+                        view_schema, tbl_name, tbl_name);
+                    RAISE NOTICE 'Created stable view: %.% -> static_foreign.%', view_schema, tbl_name, tbl_name;
+                ELSE
+                    RAISE NOTICE 'Table static_foreign.% does not exist, skipping', tbl_name;
+                END IF;
+            END LOOP;
+        END IF;
     END IF;
 
     -- Create stable views for stedsnavn tables from public schema

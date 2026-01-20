@@ -20,6 +20,7 @@ For cron, add to crontab:
 
 import os
 import sys
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
@@ -409,32 +410,77 @@ def download_datasets(config_path: Path, log_file: Path) -> bool:
     """Download datasets using download function."""
     log("==> Downloading datasets...", log_file)
 
+    # Capture stdout/stderr by redirecting temporarily
+    import io
+    from contextlib import redirect_stdout, redirect_stderr
+
+    stdout_capture = io.StringIO()
+    stderr_capture = io.StringIO()
+
     try:
-        # Capture stdout/stderr by redirecting temporarily
-        import io
-        from contextlib import redirect_stdout, redirect_stderr
-
-        stdout_capture = io.StringIO()
-        stderr_capture = io.StringIO()
-
         with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
             download_from_config(config_path)
-
-        # Write captured output to log
+    except BaseException as e:
+        # Write captured output to log even on failure
         stdout_output = stdout_capture.getvalue()
         stderr_output = stderr_capture.getvalue()
-
         with open(log_file, 'a') as f:
             if stdout_output:
                 f.write(stdout_output)
             if stderr_output:
                 f.write(stderr_output)
-
-        log("✓ Download completed", log_file)
-        return True
-    except Exception as e:
         log(f"✗ Download failed: {e}", log_file)
         return False
+
+    # Write captured output to log on success
+    stdout_output = stdout_capture.getvalue()
+    stderr_output = stderr_capture.getvalue()
+    with open(log_file, 'a') as f:
+        if stdout_output:
+            f.write(stdout_output)
+        if stderr_output:
+            f.write(stderr_output)
+
+    log("✓ Download completed", log_file)
+    return True
+
+
+def can_skip_failed_download(
+    configs: List[Dict[str, Any]],
+    database: str,
+    log_file: Path,
+) -> bool:
+    """Check if downloads can be skipped because data is already current."""
+    log("  ⚠ Download failed; checking existing files/tables...", log_file)
+
+    for cfg in configs:
+        name = cfg.get('name', 'unknown')
+        format_type = cfg.get('format', '')
+        output_dir_str = cfg.get('output_dir', './data')
+        output_dir = Path(output_dir_str).resolve()
+
+        zip_files = list(output_dir.glob('*.zip'))
+        if not zip_files:
+            log(f"    ✗ [{name}] No ZIP files found in {output_dir}", log_file)
+            return False
+
+        if len(zip_files) > 1:
+            zip_files = sorted(zip_files, key=lambda p: p.stat().st_mtime, reverse=True)
+        zip_file = zip_files[0].resolve()
+
+        gml_table_name = None
+        if format_type == 'GML':
+            gml_table_name = name.lower().replace('-', '_').replace(' ', '_')
+
+        import_needed, reason = check_import_needed(zip_file, database, format_type, gml_table_name)
+        if import_needed:
+            log(f"    ✗ [{name}] Import needed: {reason}", log_file)
+            return False
+
+        log(f"    ⊙ [{name}] Up-to-date: {reason}", log_file)
+
+    log("  ✓ All datasets are current; proceeding without download", log_file)
+    return True
 
 
 def load_postgis_dataset(zip_file: Path, database: str, log_file: Path) -> bool:
@@ -626,8 +672,9 @@ def main():
 
     # Download datasets
     if not download_datasets(config_path, log_file):
-        log("ERROR: Download failed - aborting", log_file)
-        sys.exit(1)
+        if not can_skip_failed_download(configs, database, log_file):
+            log("ERROR: Download failed - aborting", log_file)
+            sys.exit(1)
 
     # Load each dataset
     log("==> Loading datasets into database...", log_file)
@@ -657,32 +704,37 @@ def main():
         if format_type == 'GML':
             gml_table_name = name.lower().replace('-', '_').replace(' ', '_')
 
-        # For PostGIS format or single-file GML: use most recent ZIP
-        # For multi-file GML datasets (like FKB-TraktorvegSti with municipalities): process all ZIPs
-        is_multi_file_gml = (format_type == 'GML' and len(zip_files) > 10)
-        # Threshold: if more than 10 ZIP files, assume it's a multi-file dataset
+        # Use most recent ZIP
+        if len(zip_files) > 1:
+            zip_files = sorted(zip_files, key=lambda p: p.stat().st_mtime, reverse=True)
+            log(f"    ℹ Found {len(zip_files)} ZIP files, using most recent: {zip_files[0].name}", log_file)
+            zip_files = zip_files[:1]
 
-        if is_multi_file_gml:
-            log(f"    ℹ Found {len(zip_files)} ZIP files (multi-file dataset), processing all...", log_file)
-            # Sort by modification time for consistent processing
-            zip_files = sorted(zip_files, key=lambda p: p.stat().st_mtime)
+        zip_file = zip_files[0]
+        if not isinstance(zip_file, Path):
+            zip_file = Path(zip_file)
+        zip_file = zip_file.resolve()
 
-            # Check if import is needed (check first file as representative)
-            first_zip = zip_files[0]
-            if not isinstance(first_zip, Path):
-                first_zip = Path(first_zip)
-            first_zip = first_zip.resolve()
+        # Check if import is needed
+        import_needed, reason = check_import_needed(zip_file, database, format_type, gml_table_name)
 
-            import_needed, reason = check_import_needed(first_zip, database, format_type, gml_table_name)
+        if not import_needed:
+            log(f"    ⊙ Skipping import: {reason}", log_file)
+            success_count += 1
+            continue
 
-            if not import_needed:
-                log(f"    ⊙ Skipping import: {reason}", log_file)
+        log(f"    → Import needed: {reason}", log_file)
+
+        if format_type == 'PostGIS':
+            if load_postgis_dataset(zip_file, database, log_file):
+                log(f"    ✓ {name} loaded successfully", log_file)
                 success_count += 1
-                continue
+            else:
+                log(f"    ✗ Failed to load {name}", log_file)
+                failed_count += 1
+                sys.exit(1)
 
-            log(f"    → Import needed: {reason}", log_file)
-
-            # Process all ZIP files for multi-file GML dataset
+        elif format_type == 'GML':
             table_name = gml_table_name
             if isinstance(utm_zone, int):
                 srid = utm_zone
@@ -691,99 +743,34 @@ def main():
             else:
                 srid = 25833  # Default
 
-            # Load first file with overwrite, then append others
-            success = True
-            for idx, zip_file in enumerate(zip_files):
-                if not isinstance(zip_file, Path):
-                    zip_file = Path(zip_file)
-                zip_file = zip_file.resolve()
-
-                if idx == 0:
-                    # First file: overwrite table
-                    if not load_gml_dataset(zip_file, database, table_name, srid, log_file, append=False):
-                        success = False
-                        break
-                else:
-                    # Subsequent files: append to table
-                    if not load_gml_dataset(zip_file, database, table_name, srid, log_file, append=True):
-                        log(f"    ✗ Failed to append {zip_file.name}", log_file)
-                        sys.exit(1)
-
-            if success:
-                log(f"    ✓ {name} loaded successfully ({len(zip_files)} files)", log_file)
+            if load_gml_dataset(zip_file, database, table_name, srid, log_file):
+                log(f"    ✓ {name} loaded successfully", log_file)
                 success_count += 1
             else:
                 log(f"    ✗ Failed to load {name}", log_file)
                 failed_count += 1
+                sys.exit(1)
 
-        else:
-            # Single file or PostGIS: use most recent ZIP
-            if len(zip_files) > 1:
-                zip_files = sorted(zip_files, key=lambda p: p.stat().st_mtime, reverse=True)
-                log(f"    ℹ Found {len(zip_files)} ZIP files, using most recent: {zip_files[0].name}", log_file)
-                zip_files = zip_files[:1]
-
-            zip_file = zip_files[0]
-            if not isinstance(zip_file, Path):
-                zip_file = Path(zip_file)
-            zip_file = zip_file.resolve()
-
-            # Check if import is needed
-            import_needed, reason = check_import_needed(zip_file, database, format_type, gml_table_name)
-
-            if not import_needed:
-                log(f"    ⊙ Skipping import: {reason}", log_file)
-                success_count += 1
-                continue
-
-            log(f"    → Import needed: {reason}", log_file)
-
-            if format_type == 'PostGIS':
-                if load_postgis_dataset(zip_file, database, log_file):
-                    log(f"    ✓ {name} loaded successfully", log_file)
-                    success_count += 1
-                else:
-                    log(f"    ✗ Failed to load {name}", log_file)
-                    failed_count += 1
-                    sys.exit(1)
-
-            elif format_type == 'GML':
-                table_name = gml_table_name
-                if isinstance(utm_zone, int):
-                    srid = utm_zone
-                elif isinstance(utm_zone, str) and utm_zone.isdigit():
-                    srid = int(utm_zone)
-                else:
-                    srid = 25833  # Default
-
-                if load_gml_dataset(zip_file, database, table_name, srid, log_file):
-                    log(f"    ✓ {name} loaded successfully", log_file)
-                    success_count += 1
-                else:
-                    log(f"    ✗ Failed to load {name}", log_file)
-                    failed_count += 1
-                    sys.exit(1)
-
-            elif format_type == 'FGDB':
-                if isinstance(utm_zone, int):
-                    srid = utm_zone
-                elif isinstance(utm_zone, str) and utm_zone.isdigit():
-                    srid = int(utm_zone)
-                else:
-                    srid = 25833  # Default
-
-                if load_fgdb_dataset(zip_file, database, srid, log_file):
-                    log(f"    ✓ {name} loaded successfully", log_file)
-                    success_count += 1
-                else:
-                    log(f"    ✗ Failed to load {name}", log_file)
-                    failed_count += 1
-                    sys.exit(1)
-
+        elif format_type == 'FGDB':
+            if isinstance(utm_zone, int):
+                srid = utm_zone
+            elif isinstance(utm_zone, str) and utm_zone.isdigit():
+                srid = int(utm_zone)
             else:
-                log(f"    ✗ Unknown format '{format_type}'", log_file)
+                srid = 25833  # Default
+
+            if load_fgdb_dataset(zip_file, database, srid, log_file):
+                log(f"    ✓ {name} loaded successfully", log_file)
+                success_count += 1
+            else:
+                log(f"    ✗ Failed to load {name}", log_file)
                 failed_count += 1
                 sys.exit(1)
+
+        else:
+            log(f"    ✗ Unknown format '{format_type}'", log_file)
+            failed_count += 1
+            sys.exit(1)
 
     # Summary
     log("==> Update completed", log_file)
@@ -803,40 +790,72 @@ def main():
         log("  ⊙ No successful imports - skipping sanity checks", log_file)
 
     # Run migrations after data import
+    has_turrutebasen = any(
+        (cfg.get('name', '').lower() == 'turrutebasen')
+        or ('turrutebasen' in cfg.get('dataset', '').lower())
+        for cfg in configs
+    )
     log("==> Running database migrations...", log_file)
     try:
-        # Import migration functions
-        from run_migrations import find_migration_files, run_migration, get_db_connection_params as get_migration_db_params
-
         script_dir = Path(__file__).parent
         project_root = script_dir.parent
         migration_dir = project_root / 'migrations'
 
-        migration_files = find_migration_files(migration_dir)
-        if migration_files:
-            log(f"  Found {len(migration_files)} migration(s)", log_file)
-            migration_db_params = get_migration_db_params()
-            migration_db_params['database'] = database
+        if has_turrutebasen:
+            log("  ⊙ Turrutebasen refresh: running full migration pipeline", log_file)
+            migrate_cmd = [
+                sys.executable,
+                str(script_dir / "run_migrations.py"),
+                database,
+            ]
+            subprocess.run(migrate_cmd, check=True, env=os.environ.copy())
+        else:
+            # Import migration functions for static-only runs
+            from run_migrations import find_migration_files, run_migration, get_db_connection_params as get_migration_db_params
 
-            migration_success = 0
-            migration_failed = 0
-            for migration_file in migration_files:
-                log(f"  -> Running {migration_file.name}...", log_file)
-                if run_migration(migration_db_params, migration_file):
-                    log(f"     ✓ {migration_file.name} completed", log_file)
-                    migration_success += 1
-                else:
-                    log(f"     ✗ {migration_file.name} failed", log_file)
-                    migration_failed += 1
+            migration_files = find_migration_files(migration_dir)
+            allowed = {
+                "000_setup_roles.sql",
+                "005_create_stable_views.sql",
+                "006_add_static_indexes.sql",
+                "008_fix_grant_schema_privileges_for_prefix.sql",
+            }
+            migration_files = [f for f in migration_files if f.name in allowed]
+            log("  ⊙ Static-only refresh: running roles, static indexes, stable views", log_file)
+            if migration_files:
+                log(f"  Found {len(migration_files)} migration(s)", log_file)
+                migration_db_params = get_migration_db_params()
+                migration_db_params['database'] = database
+
+                migration_success = 0
+                migration_failed = 0
+                for migration_file in migration_files:
+                    log(f"  -> Running {migration_file.name}...", log_file)
+                    if run_migration(migration_db_params, migration_file):
+                        log(f"     ✓ {migration_file.name} completed", log_file)
+                        migration_success += 1
+                    else:
+                        log(f"     ✗ {migration_file.name} failed", log_file)
+                        migration_failed += 1
+                        sys.exit(1)
+
+                if migration_success > 0:
+                    log(f"  ✓ Migrations completed: {migration_success} successful", log_file)
+                if migration_failed > 0:
+                    log(f"  ✗ Some migrations failed: {migration_failed} failed", log_file)
                     sys.exit(1)
 
-            if migration_success > 0:
-                log(f"  ✓ Migrations completed: {migration_success} successful", log_file)
-            if migration_failed > 0:
-                log(f"  ✗ Some migrations failed: {migration_failed} failed", log_file)
-                sys.exit(1)
-        else:
-            log("  ℹ No migrations found", log_file)
+                # Refresh stable views after imports/migrations
+                migration_005 = next((f for f in migration_files if f.name.startswith('005_')), None)
+                if migration_005:
+                    log(f"  -> Refreshing views with {migration_005.name}...", log_file)
+                    if run_migration(migration_db_params, migration_005):
+                        log(f"     ✓ {migration_005.name} completed", log_file)
+                    else:
+                        log(f"     ✗ {migration_005.name} failed", log_file)
+                        sys.exit(1)
+            else:
+                log("  ℹ No migrations found", log_file)
     except ImportError as e:
         log(f"  ✗ Could not import migration runner: {e}", log_file)
         sys.exit(1)

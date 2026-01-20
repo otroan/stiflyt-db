@@ -23,7 +23,7 @@ import argparse
 import re
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
-from update_datasets import load_config
+
 
 def get_db_connection_params() -> dict:
     """Get database connection parameters from environment or defaults.

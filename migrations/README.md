@@ -104,7 +104,14 @@ SELECT * FROM turogfriluftsruter_abc123.fotrute;
 SELECT * FROM stiflyt.fotrute;
 ```
 
-**Note**: PostGIS automatically creates GIST indexes on geometry columns (including `teig.omrade`), so no separate migration is needed for teig spatial indexes.
+### `006_add_static_indexes.sql`
+
+Creates spatial GIST indexes for static datasets:
+
+- `matrikkeleneiendomskartteig_*.teig(<geom>)`
+- `public.sted_posisjon(<geom>)`
+
+These indexes are required for fast spatial lookups and are not created automatically.
 
 ## Creating New Migrations
 

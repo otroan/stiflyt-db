@@ -12,7 +12,7 @@ VENV := venv
 PYTHON := $(VENV)/bin/python3
 PIP := $(VENV)/bin/pip
 
-.PHONY: dependencies help create-db ensure-db drop-db load-dataset update-datasets db-status inspect-db run-migrations verify-migration build-links cron-update setup-roles fresh-start init-db refresh-db refresh-db-swap test
+.PHONY: dependencies help create-db refresh-turrutebasen refresh-static
 
 help:
 	@echo "stiflyt-db Makefile"
@@ -20,15 +20,8 @@ help:
 	@echo "Common targets:"
 	@echo "  make dependencies   Install system deps (Debian/Ubuntu)"
 	@echo "  make create-db      Create database + PostGIS extension"
-	@echo "  make setup-roles    Create roles/privileges (superuser)"
-	@echo "  make update-datasets Download + load datasets from config"
-	@echo "  make run-migrations Run SQL migrations"
-	@echo "  make fresh-start    Drop + recreate + load + migrate"
-	@echo "  make refresh-db     Reload data + migrations without drop"
-	@echo "  make refresh-db-swap Build new DB and swap names"
-	@echo "  make db-status      Health check"
-	@echo "  make inspect-db     Schema overview"
-	@echo "  make test           Run tests"
+	@echo "  make refresh-turrutebasen Daily turrutebasen refresh"
+	@echo "  make refresh-static Monthly static refresh"
 	@echo ""
 	@echo "Variables:"
 	@echo "  PGDATABASE=$(PGDATABASE) PGHOST=$(PGHOST) PGPORT=$(PGPORT)"
@@ -90,7 +83,8 @@ dependencies:
 	@echo "Neste steg:"
 	@echo "  1. Start PostgreSQL: sudo systemctl start postgresql"
 	@echo "  2. Opprett database: make create-db"
-	@echo "  3. Last ned data: make download-matrikkel"
+	@echo "  3. Månedlig: make refresh-static"
+	@echo "  4. Daglig: make refresh-turrutebasen"
 	@echo ""
 	@echo "Note: Scripts bruker virtual environment i $(VENV)/"
 	@echo "      For manuell bruk: source $(VENV)/bin/activate"
@@ -115,224 +109,35 @@ create-db:
 			 echo "     PGADMIN_USER=postgres PGPASSWORD=password make create-db"; \
 			 exit 1)); \
 	if [ "$(PGHOST)" = "localhost" ]; then \
-		PGPASSWORD=$(PGPASSWORD) psql -U $(PGUSER) -d $(PGDATABASE) \
-			-c "CREATE EXTENSION IF NOT EXISTS postgis;" > /dev/null 2>&1 && echo "  ✓ PostGIS extension aktivert" || \
-			(echo "  ⚠ Kunne ikke aktivere PostGIS extension som $(PGUSER)"; \
-			 echo "     Prøver som postgres superuser..."; \
-			 sudo -u postgres psql -d $(PGDATABASE) -c "CREATE EXTENSION IF NOT EXISTS postgis;" > /dev/null 2>&1 && echo "  ✓ PostGIS extension aktivert (som postgres)" || \
-			 (echo "  ✗ Kunne ikke aktivere PostGIS extension"; \
-			  echo "     Kjør manuelt: sudo -u postgres psql -d $(PGDATABASE) -c 'CREATE EXTENSION postgis;'"; \
-			  exit 1)); \
+		PGPASSWORD=$(PGPASSWORD) psql -U $(PGADMIN_USER) -d $(PGDATABASE) -t -A \
+			-c "SELECT extname FROM pg_extension WHERE extname = 'postgis';" 2>&1 | grep -q postgis \
+			&& echo "  ✓ PostGIS extension allerede aktivert" \
+			|| (PGPASSWORD=$(PGPASSWORD) psql -U $(PGUSER) -d $(PGDATABASE) \
+				-c "CREATE EXTENSION IF NOT EXISTS postgis;" > /dev/null 2>&1 && echo "  ✓ PostGIS extension aktivert" || \
+				(echo "  ⚠ Kunne ikke aktivere PostGIS extension som $(PGUSER)"; \
+				 echo "     Prøver som postgres superuser..."; \
+				 sudo -u postgres psql -d $(PGDATABASE) -c "CREATE EXTENSION IF NOT EXISTS postgis;" > /dev/null 2>&1 && echo "  ✓ PostGIS extension aktivert (som postgres)" || \
+				 (echo "  ✗ Kunne ikke aktivere PostGIS extension"; \
+				  echo "     Kjør manuelt: sudo -u postgres psql -d $(PGDATABASE) -c 'CREATE EXTENSION postgis;'"; \
+				  exit 1))); \
 	else \
-		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGUSER) -d $(PGDATABASE) \
-			-c "CREATE EXTENSION IF NOT EXISTS postgis;" > /dev/null 2>&1 && echo "  ✓ PostGIS extension aktivert" || \
-			(echo "  ✗ Kunne ikke aktivere PostGIS extension"; \
-			 echo "     Bruk superuser: PGUSER=postgres PGPASSWORD=password make create-db"; \
-			 exit 1); \
+		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d $(PGDATABASE) -t -A \
+			-c "SELECT extname FROM pg_extension WHERE extname = 'postgis';" 2>&1 | grep -q postgis \
+			&& echo "  ✓ PostGIS extension allerede aktivert" \
+			|| (PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGUSER) -d $(PGDATABASE) \
+				-c "CREATE EXTENSION IF NOT EXISTS postgis;" > /dev/null 2>&1 && echo "  ✓ PostGIS extension aktivert" || \
+				(echo "  ✗ Kunne ikke aktivere PostGIS extension"; \
+				 echo "     Bruk superuser: PGUSER=postgres PGPASSWORD=password make create-db"; \
+				 exit 1)); \
 	fi
 
-# Ensure database exists (safe to run multiple times)
-ensure-db: create-db
+refresh-turrutebasen: $(VENV)
+	@echo "==> Refresh turrutebasen (daily) ..."
+	@PGUSER=stiflyt_updater $(PYTHON) scripts/refresh_swap.py $(PGDATABASE) --config-file datasets_turrutebasen_only.yaml
 
-# Fresh start: Drop and recreate database with proper setup
-fresh-start:
-	@echo "==> FRESH START: Sletter og gjenoppretter database..."
-	@echo "  ⚠ Dette vil slette all eksisterende data!"
-	@read -p "  Er du sikker? (skriv 'yes' for å bekrefte): " confirm && [ "$$confirm" = "yes" ] || exit 1
-	@echo ""
-	@echo "==> Steg 1: Sletter eksisterende database..."
-	@if [ "$(PGHOST)" = "localhost" ]; then \
-		PSQL_HOST="" PSQL_PORT=""; \
-	else \
-		PSQL_HOST="-h $(PGHOST)"; PSQL_PORT="-p $(PGPORT)"; \
-	fi; \
-	if command -v sudo > /dev/null 2>&1 && id postgres > /dev/null 2>&1; then \
-		sudo -u postgres psql $$PSQL_HOST $$PSQL_PORT -c "DROP DATABASE IF EXISTS $(PGDATABASE);" 2>&1 && echo "  ✓ Database slettet" || echo "  ⊙ Database eksisterte ikke"; \
-	elif [ "$(PGHOST)" = "localhost" ]; then \
-		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d postgres -c "DROP DATABASE IF EXISTS $(PGDATABASE);" 2>&1 && echo "  ✓ Database slettet" || \
-		(PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -d postgres -c "DROP DATABASE IF EXISTS $(PGDATABASE);" 2>&1 && echo "  ✓ Database slettet" || echo "  ⊙ Database eksisterte ikke"); \
-	else \
-		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d postgres -c "DROP DATABASE IF EXISTS $(PGDATABASE);" 2>&1 && echo "  ✓ Database slettet" || echo "  ⊙ Database eksisterte ikke"; \
-	fi
-	@echo ""
-	@echo "==> Steg 2: Oppretter ny database..."
-	@if [ "$(PGHOST)" = "localhost" ]; then \
-		PSQL_HOST="" PSQL_PORT=""; \
-	else \
-		PSQL_HOST="-h $(PGHOST)"; PSQL_PORT="-p $(PGPORT)"; \
-	fi; \
-	if command -v sudo > /dev/null 2>&1 && id postgres > /dev/null 2>&1; then \
-		sudo -u postgres psql $$PSQL_HOST $$PSQL_PORT -c "CREATE DATABASE $(PGDATABASE);" 2>&1 && echo "  ✓ Database opprettet" || (echo "  ✗ Kunne ikke opprette database"; exit 1); \
-		sudo -u postgres psql $$PSQL_HOST $$PSQL_PORT -d $(PGDATABASE) -c "CREATE EXTENSION IF NOT EXISTS postgis;" 2>&1 > /dev/null && echo "  ✓ PostGIS extension aktivert" || (echo "  ✗ Kunne ikke aktivere PostGIS"; exit 1); \
-	elif [ "$(PGHOST)" = "localhost" ]; then \
-		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d postgres -c "CREATE DATABASE $(PGDATABASE);" 2>&1 && echo "  ✓ Database opprettet" || \
-		(PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -d postgres -c "CREATE DATABASE $(PGDATABASE);" 2>&1 && echo "  ✓ Database opprettet" || (echo "  ✗ Kunne ikke opprette database"; exit 1)); \
-		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d $(PGDATABASE) -c "CREATE EXTENSION IF NOT EXISTS postgis;" 2>&1 > /dev/null && echo "  ✓ PostGIS extension aktivert" || \
-		(PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -d $(PGDATABASE) -c "CREATE EXTENSION IF NOT EXISTS postgis;" 2>&1 > /dev/null && echo "  ✓ PostGIS extension aktivert" || (echo "  ✗ Kunne ikke aktivere PostGIS"; exit 1)); \
-	else \
-		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d postgres -c "CREATE DATABASE $(PGDATABASE);" 2>&1 && echo "  ✓ Database opprettet" || (echo "  ✗ Kunne ikke opprette database"; exit 1); \
-		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d $(PGDATABASE) -c "CREATE EXTENSION IF NOT EXISTS postgis;" 2>&1 > /dev/null && echo "  ✓ PostGIS extension aktivert" || (echo "  ✗ Kunne ikke aktivere PostGIS"; exit 1); \
-	fi
-	@echo ""
-	@echo "==> Steg 3: Setter opp roller og privilegier..."
-	@if [ "$(PGHOST)" = "localhost" ]; then \
-		PSQL_HOST="" PSQL_PORT=""; \
-		if command -v sudo > /dev/null 2>&1 && id postgres > /dev/null 2>&1; then \
-			sudo -u postgres psql $$PSQL_HOST $$PSQL_PORT -d $(PGDATABASE) -f migrations/000_setup_roles.sql 2>&1 | grep -v "^WARNING:" | grep -v "^NOTICE:" || true; \
-		else \
-			PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d $(PGDATABASE) -f migrations/000_setup_roles.sql 2>&1 | grep -v "^WARNING:" | grep -v "^NOTICE:" || \
-			(PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -d $(PGDATABASE) -f migrations/000_setup_roles.sql 2>&1 | grep -v "^WARNING:" | grep -v "^NOTICE:" || true); \
-		fi; \
-	else \
-		PSQL_HOST="-h $(PGHOST)"; PSQL_PORT="-p $(PGPORT)"; \
-		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d $(PGDATABASE) -f migrations/000_setup_roles.sql 2>&1 | grep -v "^WARNING:" | grep -v "^NOTICE:" || true; \
-	fi
-	@echo "  ✓ Roller konfigurert"
-	@echo ""
-	@echo "==> Steg 4: Laster inn data (dette kan ta lang tid)..."
-	@PGUSER=stiflyt_updater $(MAKE) update-datasets
-	@echo ""
-	@echo "==> Steg 5: Bygger links-tabell (kreves for views)..."
-	@PGUSER=stiflyt_updater $(MAKE) build-links || (echo "  ⚠ build-links feilet - migrasjoner vil prøve igjen automatisk" && true)
-	@echo ""
-	@echo "==> Steg 6: Kjør migrasjoner..."
-	@PGUSER=stiflyt_updater $(MAKE) run-migrations
-	@echo ""
-	@echo "==> Fresh start fullført!"
-	@echo "  ✅ Database er initialisert og oppdatert"
-
-# Initialize everything from zero (drop + recreate + load + migrations)
-init-db: fresh-start
-
-# Refresh data and migrations without dropping database
-refresh-db: $(VENV)
-	@echo "==> Refresh: Oppdaterer data og kjører migrasjoner..."
-	@PGUSER=stiflyt_updater $(MAKE) update-datasets
-	@echo ""
-	@echo "==> Bygger links-tabell (kreves for views)..."
-	@PGUSER=stiflyt_updater $(MAKE) build-links || (echo "  ⚠ build-links feilet - migrasjoner vil prøve igjen automatisk" && true)
-	@echo ""
-	@PGUSER=stiflyt_updater $(MAKE) run-migrations
-
-# Refresh with DB name swap (build new DB, then swap names)
-refresh-db-swap: $(VENV)
-	@echo "==> Refresh swap: bygger ny database og bytter navn..."
-	@PGUSER=stiflyt_updater $(PYTHON) scripts/refresh_swap.py
-
-# Setup database roles and permissions (run once after create-db)
-# Requires superuser privileges - automatically tries as postgres if current user fails
-setup-roles:
-	@echo "==> Setting up database roles and permissions..."
-	@if [ "$(PGHOST)" = "localhost" ]; then \
-		PSQL_HOST="" PSQL_PORT=""; \
-		if command -v sudo > /dev/null 2>&1; then \
-			echo "  ℹ Kjører som postgres superuser (kreves for å opprette roller)..."; \
-			sudo -u postgres psql -d $(PGDATABASE) -f migrations/000_setup_roles.sql 2>&1 | grep -v "^ERROR:" || true; \
-			if sudo -u postgres psql -d $(PGDATABASE) -t -c "SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_updater'" 2>/dev/null | grep -q 1; then \
-				echo "  ✓ Roles configured"; \
-			else \
-				echo "  ✗ Kunne ikke opprette roller."; \
-				echo "     Kjør manuelt:"; \
-				echo "     sudo -u postgres psql -d $(PGDATABASE) -f migrations/000_setup_roles.sql"; \
-				exit 1; \
-			fi; \
-		else \
-			echo "  ✗ sudo ikke tilgjengelig. Kjør manuelt:"; \
-			echo "     sudo -u postgres psql -d $(PGDATABASE) -f migrations/000_setup_roles.sql"; \
-			exit 1; \
-		fi; \
-	else \
-		PSQL_HOST="-h $(PGHOST)"; PSQL_PORT="-p $(PGPORT)"; \
-		if [ -z "$(PGPASSWORD)" ]; then \
-			echo "  ⚠ PGPASSWORD må settes for remote connections"; \
-			exit 1; \
-		fi; \
-		echo "  ℹ Kjører som postgres superuser..."; \
-		PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U postgres -d $(PGDATABASE) \
-			-f migrations/000_setup_roles.sql 2>&1 | grep -v "^ERROR:" || true; \
-		if PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U postgres -d $(PGDATABASE) \
-			-t -c "SELECT 1 FROM pg_roles WHERE rolname = 'stiflyt_updater'" 2>/dev/null | grep -q 1; then \
-			echo "  ✓ Roles configured"; \
-		else \
-			echo "  ✗ Kunne ikke opprette roller."; \
-			exit 1; \
-		fi; \
-	fi
-
-drop-db:
-	@echo "==> Sletter database '$(PGDATABASE)' ..."
-	@if [ "$(PGHOST)" = "localhost" ]; then \
-		PSQL_HOST="" PSQL_PORT=""; \
-	else \
-		PSQL_HOST="-h $(PGHOST)"; PSQL_PORT="-p $(PGPORT)"; \
-	fi; \
-	PGPASSWORD=$(PGPASSWORD) psql $$PSQL_HOST $$PSQL_PORT -U $(PGADMIN_USER) -d postgres \
-		-c "DROP DATABASE IF EXISTS $(PGDATABASE);" 2>&1 && echo "  ✓ Database slettet" || \
-		(echo "  ✗ Kunne ikke slette database"; exit 1)
-
-
-# Load any dataset (auto-detects PostGIS SQL or GML format)
-# Usage: make load-dataset ZIP_FILE=data/stedsnavn/file.zip TABLE=stedsnavn SRID=25833
-# Note: Uses stiflyt_updater by default (requires write permissions)
-load-dataset: ensure-db $(VENV)
-	@if [ -z "$(ZIP_FILE)" ]; then \
-		echo "Feil: ZIP_FILE må angis. Eksempel: make load-dataset ZIP_FILE=data/stedsnavn/file.zip TABLE=stedsnavn"; \
-		exit 1; \
-	fi
-	@PGUSER=$${PGUSER:-stiflyt_updater} $(PYTHON) ./scripts/load_dataset.py "$(ZIP_FILE)" $(PGDATABASE) $(TABLE) $(SRID) --drop-tables
-
-# Update all datasets from config file (cron-friendly)
-# This downloads updates and reloads data, replacing old tables
-update-datasets: $(VENV)
-	@PGUSER=$${PGUSER:-stiflyt_updater} $(PYTHON) scripts/update_datasets.py $(or $(CONFIG_FILE),datasets.yaml) $(PGDATABASE)
-
-# Check database status and health
-db-status: $(VENV)
-	@$(PYTHON) scripts/db_status.py $(PGDATABASE)
-
-# Inspect database schema (tables, columns, indexes, SRIDs)
-inspect-db: $(VENV)
-	@if [ "$(PGHOST)" = "localhost" ] || [ -z "$(PGHOST)" ]; then \
-		PGUSER=$(PGUSER) PGPASSWORD=$(PGPASSWORD) $(PYTHON) scripts/inspect_db.py $(PGDATABASE) --tables; \
-	else \
-		PGUSER=$(PGUSER) PGHOST=$(PGHOST) PGPORT=$(PGPORT) PGPASSWORD=$(PGPASSWORD) $(PYTHON) scripts/inspect_db.py $(PGDATABASE) --tables; \
-	fi
-
-# Run database migrations (creates indexes, updates statistics, etc.)
-# Migrations run automatically after update-datasets, but can be run manually
-# Note: build-links runs automatically before migration 003 if needed
-run-migrations: $(VENV)
-	@PGUSER=$${PGUSER:-stiflyt_updater} $(PYTHON) scripts/run_migrations.py $(PGDATABASE)
-
-# Verify that migration indexes were created successfully
-verify-migration: $(VENV)
-	@$(PYTHON) scripts/verify_migration.py $(PGDATABASE)
-
-# Build links from segments and anchor nodes
-# Creates links and link_segments tables with topology
-# This is a heavy operation and should be run after data import
-# Note: build-links runs automatically via run-migrations before migration 003
-# This target is for manual execution or when you need to rebuild links separately
-build-links: $(VENV)
-	@echo "==> Building links (this may take a while)..."
-	@$(PYTHON) scripts/build_links.py --log-dir ./logs || (echo "✗ build-links failed - check logs/build_links_*.log" && exit 1)
-
-# Cron-friendly full refresh: download/update datasets and run migrations
-# Migrations automatically run build-links before migration 003 if needed
-# Each step runs independently - if one fails, the next still runs
-# Check logs/ for detailed output
-cron-update: $(VENV)
-	@echo "=== Starting cron-update pipeline ==="
-	@echo "Step 1: Update datasets..."
-	@$(MAKE) update-datasets || (echo "⚠ update-datasets failed - continuing with migrations" && true)
-	@echo ""
-	@echo "Step 2: Build links (required for views)..."
-	@$(MAKE) build-links || (echo "⚠ build-links failed - migrations will try again automatically" && true)
-	@echo ""
-	@echo "Step 3: Run migrations..."
-	@$(MAKE) run-migrations || (echo "✗ run-migrations failed" && exit 1)
-	@echo ""
-	@echo "=== cron-update pipeline completed ==="
+refresh-static: $(VENV)
+	@echo "==> Refresh static datasets (monthly) ..."
+	@PGUSER=stiflyt_updater $(PYTHON) scripts/refresh_swap.py $(PGDATABASE) --config-file datasets.yaml
 
 # Ensure virtual environment exists
 $(VENV):
@@ -342,9 +147,4 @@ $(VENV):
 	@$(PIP) install -e . > /dev/null 2>&1
 	@echo "  ✓ Virtual environment klar"
 
-# Run tests
-test: $(VENV)
-	@echo "==> Running tests..."
-	@$(PIP) install -e ".[dev]" > /dev/null 2>&1
-	@$(VENV)/bin/python -m pytest tests/ -v
 

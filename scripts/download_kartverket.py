@@ -701,8 +701,8 @@ def process_download_urls(
     dataset_name: str,
     utm_zone: str,
     format_type: str = "PostGIS"
-) -> int:
-    """Process list of URLs, download if needed, return download count.
+) -> Tuple[int, int]:
+    """Process list of URLs, download if needed, return counts.
 
     Args:
         urls: List of (url, feed_updated_timestamp) tuples
@@ -712,9 +712,10 @@ def process_download_urls(
         format_type: Format type (for filename generation)
 
     Returns:
-        Number of files downloaded
+        Tuple of (downloaded_count, up_to_date_count)
     """
     download_count = 0
+    up_to_date_count = 0
 
     for url, feed_updated in urls:
         # Generate filename from URL
@@ -734,7 +735,7 @@ def process_download_urls(
             if is_valid and is_up_to_date:
                 file_size = format_size(output_path.stat().st_size)
                 print(f"     ✓ Fil er komplett og oppdatert ({file_size})")
-                download_count += 1
+                up_to_date_count += 1
                 continue
             elif is_valid and not is_up_to_date:
                 file_size = format_size(output_path.stat().st_size)
@@ -762,7 +763,7 @@ def process_download_urls(
             if output_path.exists():
                 output_path.unlink()
 
-    return download_count
+    return download_count, up_to_date_count
 
 
 def get_atom_feed_url(
@@ -987,6 +988,13 @@ def download_single_dataset(dataset_config: Dict[str, Any], index: int, total: i
         print()
 
     try:
+        if download_url:
+            outdir = Path(output_dir)
+            outdir.mkdir(parents=True, exist_ok=True)
+            filename = os.path.basename(urllib.parse.urlparse(download_url).path)
+            if not filename:
+                filename = f"{name}.zip"
+            output_path = outdir / filename
 
             if download_file(download_url, output_path):
                 file_size = format_size(output_path.stat().st_size)
@@ -1042,16 +1050,22 @@ def download_single_dataset(dataset_config: Dict[str, Any], index: int, total: i
             print(f"  ✓ [{name}] Fant {len(urls)} fil(er) som matcher kriteriene")
 
         # Download files
-        download_count = process_download_urls(urls, outdir, name, str(utm_zone), format_pref)
+        download_count, up_to_date_count = process_download_urls(
+            urls, outdir, name, str(utm_zone), format_pref
+        )
 
         if download_count > 0:
             with print_lock:
                 print(f"  ✓ [{name}] Ferdig ({download_count} fil(er) lastet ned)\n")
             return (name, True, download_count, None)
+        if up_to_date_count > 0:
+            with print_lock:
+                print(f"  ⊙ [{name}] Ingen nye filer lastet ned\n")
+            return (name, True, 0, None)
         else:
             with print_lock:
-                print(f"  ⚠ [{name}] Ingen nye filer lastet ned\n")
-            return (name, False, 0, "No new files downloaded")
+                print(f"  ✗ [{name}] Ingen filer lastet ned\n", file=sys.stderr)
+            return (name, False, 0, "No files downloaded")
 
     except Exception as e:
         error_msg = str(e)
@@ -1182,9 +1196,11 @@ def main():
 
     # Download files
     print(f"==> Laster ned filer til {outdir}")
-    download_count = process_download_urls(urls, outdir, display_name, utm_zone, format_label)
+    download_count, up_to_date_count = process_download_urls(
+        urls, outdir, display_name, utm_zone, format_label
+    )
 
-    if download_count == 0 and len(urls) > 0:
+    if download_count == 0 and up_to_date_count > 0:
         print("Advarsel: Ingen nye filer ble lastet ned (alle eksisterer allerede?).", file=sys.stderr)
     elif download_count == 0:
         print("Feil: Ingen filer ble lastet ned.", file=sys.stderr)
