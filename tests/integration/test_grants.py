@@ -59,3 +59,22 @@ def test_grant_schema_privileges_for_prefix():
             cur.execute(f"DROP SCHEMA IF EXISTS {schema_two} CASCADE;")
             cur.execute("RESET ROLE;")
         conn.close()
+
+
+@pytest.mark.integration
+def test_stiflyt_reader_can_select():
+    db_params = load_dataset.get_db_connection_params()
+    if not db_params.get("database"):
+        pytest.skip("PGDATABASE not set")
+
+    conn = psycopg2.connect(**_connection_kwargs(db_params))
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT has_table_privilege('stiflyt_reader', 'stiflyt.fotrute', 'SELECT');")
+            assert cur.fetchone()[0]
+            cur.execute("SELECT has_table_privilege('stiflyt_reader', 'stiflyt.routes', 'SELECT');")
+            assert cur.fetchone()[0]
+            cur.execute("SELECT has_table_privilege('stiflyt_reader', 'public.stedsnavn', 'SELECT');")
+            assert cur.fetchone()[0]
+    finally:
+        conn.close()

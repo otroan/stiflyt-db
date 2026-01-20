@@ -92,6 +92,69 @@ def test_routes_view_exists():
 
 
 @pytest.mark.integration
+def test_links_and_segments_exist():
+    """Ensure links/link_segments exist after build-links."""
+    db_params = load_dataset.get_db_connection_params()
+    if not db_params.get("database"):
+        pytest.skip("PGDATABASE not set")
+
+    conn = psycopg2.connect(**_connection_kwargs(db_params))
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'stiflyt'
+                  AND table_name IN ('links', 'link_segments')
+            """)
+            found = {row[0] for row in cur.fetchall()}
+            missing = {'links', 'link_segments'} - found
+            assert not missing, f"Missing stiflyt tables: {missing}"
+
+            cur.execute("SELECT COUNT(*) FROM stiflyt.links")
+            assert cur.fetchone()[0] >= 0
+            cur.execute("SELECT COUNT(*) FROM stiflyt.link_segments")
+            assert cur.fetchone()[0] >= 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.integration
+def test_stiflyt_views_resolve():
+    """Sanity-check that core stiflyt views resolve."""
+    db_params = load_dataset.get_db_connection_params()
+    if not db_params.get("database"):
+        pytest.skip("PGDATABASE not set")
+
+    conn = psycopg2.connect(**_connection_kwargs(db_params))
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name
+                FROM information_schema.views
+                WHERE table_schema = 'stiflyt'
+            """)
+            views = {row[0] for row in cur.fetchall()}
+            required = {
+                'fotrute',
+                'fotruteinfo',
+                'ruteinfopunkt',
+                'links',
+                'link_segments',
+                'nodes',
+                'anchor_nodes',
+            }
+            missing = required - views
+            assert not missing, f"Missing stiflyt views: {missing}"
+
+            # Verify views resolve to a row (or at least can be queried)
+            for view in sorted(required):
+                cur.execute(f"SELECT 1 FROM stiflyt.{view} LIMIT 1")
+    finally:
+        conn.close()
+
+
+@pytest.mark.integration
 def test_route_segments_has_required_columns():
     """Test that route_segments has all required columns."""
     db_params = load_dataset.get_db_connection_params()
