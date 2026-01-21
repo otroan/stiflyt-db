@@ -256,6 +256,19 @@ make run-migrations PGDATABASE=your_database
 python3 scripts/run_migrations.py your_database
 ```
 
+### Operational + Changeset Migrations
+
+Operational and changeset schemas are managed by dedicated scripts and are **not wired into backend startup**.
+
+```bash
+# Run operational then changeset migrations
+make db-migrate-all
+```
+
+**Execution order:**
+- Apply import/base schema first
+- Run `make db-migrate-all` last (after data import and core migrations)
+
 ### Verifying Migrations
 
 ```bash
@@ -320,6 +333,9 @@ make db-status         # Check database health and status
 make inspect-db        # Inspect database schema (tables, indexes, SRIDs)
 make run-migrations    # Run database migrations
 make verify-migration  # Verify migration indexes were created
+make db-migrate-operational # Run operational schema migration
+make db-migrate-changeset  # Run changeset schema migration
+make db-migrate-all        # Run operational then changeset
 ```
 
 ## Environment Variables
@@ -330,6 +346,13 @@ make verify-migration  # Verify migration indexes were created
 - `PGUSER` - PostgreSQL user (default: current user)
 - `PGPASSWORD` - PostgreSQL password (required if using password auth)
 - `LOG_DIR` - Log directory (default: ./logs)
+- `OP_DB_NAME` - Operational database name
+- `OP_DB_USER` - Operational database user
+- `OP_DB_PASSWORD` - Operational database password
+- `OP_DATABASE_URL` - Operational database connection URL
+- `OP_USE_UNIX_SOCKET` - Use Unix socket for operational database connections
+- `OP_DB_SOCKET_DIR` - Unix socket directory for operational database
+- `OP_SCHEMA` - Schema name used by operational tables
 
 **Note**: If you get authentication errors, try:
 - `PGUSER=postgres make create-db` (use postgres superuser)

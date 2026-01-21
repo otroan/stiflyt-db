@@ -68,27 +68,157 @@ def connect_db(db_params: dict):
         sys.exit(1)
 
 
-def list_tables(conn) -> List[Dict]:
+def list_tables(conn, include_access: bool = False) -> List[Dict]:
     """List all tables and views with basic info."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("""
-            SELECT
-                t.table_schema as schemaname,
-                t.table_name as tablename,
-                t.table_type,
-                pg_size_pretty(pg_total_relation_size(t.table_schema||'.'||t.table_name)) as size,
-                (SELECT reltuples::bigint
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE c.relname = t.table_name
-                 AND n.nspname = t.table_schema
-                 AND c.relkind IN ('r', 'v')  -- 'r' = table, 'v' = view
-                ) as estimated_rows
-            FROM information_schema.tables t
-            WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema')
-            ORDER BY t.table_schema, t.table_name
-        """)
+        if include_access:
+            cur.execute("""
+                SELECT
+                    t.table_schema as schemaname,
+                    t.table_name as tablename,
+                    t.table_type,
+                    pg_size_pretty(pg_total_relation_size(t.table_schema||'.'||t.table_name)) as size,
+                    (SELECT reltuples::bigint
+                     FROM pg_class c
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE c.relname = t.table_name
+                     AND n.nspname = t.table_schema
+                     AND c.relkind IN ('r', 'v')  -- 'r' = table, 'v' = view
+                    ) as estimated_rows,
+                    COALESCE(
+                        ARRAY_AGG(
+                            DISTINCT g.grantee || ':' || g.privilege_type
+                            ORDER BY g.grantee || ':' || g.privilege_type
+                        )
+                        FILTER (WHERE g.grantee IS NOT NULL),
+                        ARRAY[]::text[]
+                    ) as privileges
+                FROM information_schema.tables t
+                LEFT JOIN information_schema.role_table_grants g
+                    ON g.table_schema = t.table_schema
+                   AND g.table_name = t.table_name
+                WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema')
+                GROUP BY t.table_schema, t.table_name, t.table_type
+                ORDER BY t.table_schema, t.table_name
+            """)
+        else:
+            cur.execute("""
+                SELECT
+                    t.table_schema as schemaname,
+                    t.table_name as tablename,
+                    t.table_type,
+                    pg_size_pretty(pg_total_relation_size(t.table_schema||'.'||t.table_name)) as size,
+                    (SELECT reltuples::bigint
+                     FROM pg_class c
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE c.relname = t.table_name
+                     AND n.nspname = t.table_schema
+                     AND c.relkind IN ('r', 'v')  -- 'r' = table, 'v' = view
+                    ) as estimated_rows
+                FROM information_schema.tables t
+                WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema')
+                ORDER BY t.table_schema, t.table_name
+            """)
         return cur.fetchall()
+def list_schemas(conn, include_access: bool = False) -> List[Dict]:
+    """List all schemas with optional access rights."""
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        if include_access:
+            cur.execute("""
+                SELECT
+                    n.nspname as schemaname,
+                    pg_get_userbyid(n.nspowner) as owner,
+                    COALESCE(
+                        ARRAY_AGG(
+                            DISTINCT
+                            (CASE
+                                WHEN acl.grantee = 0 THEN 'PUBLIC'
+                                ELSE pg_get_userbyid(acl.grantee)
+                             END) || ':' || acl.privilege_type
+                            ORDER BY
+                                (CASE
+                                    WHEN acl.grantee = 0 THEN 'PUBLIC'
+                                    ELSE pg_get_userbyid(acl.grantee)
+                                 END) || ':' || acl.privilege_type
+                        )
+                        FILTER (WHERE acl.privilege_type IS NOT NULL),
+                        ARRAY[]::text[]
+                    ) as privileges
+                FROM pg_namespace n
+                LEFT JOIN LATERAL pg_catalog.aclexplode(n.nspacl) acl ON TRUE
+                WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
+                  AND n.nspname NOT LIKE 'pg_temp_%'
+                  AND n.nspname NOT LIKE 'pg_toast_temp_%'
+                GROUP BY n.nspname, n.nspowner
+                ORDER BY n.nspname
+            """)
+        else:
+            cur.execute("""
+                SELECT
+                    n.nspname as schemaname,
+                    pg_get_userbyid(n.nspowner) as owner
+                FROM pg_namespace n
+                WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
+                  AND n.nspname NOT LIKE 'pg_temp_%'
+                  AND n.nspname NOT LIKE 'pg_toast_temp_%'
+                ORDER BY n.nspname
+            """)
+        return cur.fetchall()
+
+
+def _group_privileges(privileges: List[str]) -> Dict[str, List[str]]:
+    grouped: Dict[str, List[str]] = {}
+    for entry in privileges or []:
+        if ':' not in entry:
+            continue
+        role, priv = entry.split(':', 1)
+        grouped.setdefault(role, [])
+        if priv not in grouped[role]:
+            grouped[role].append(priv)
+    for role in grouped:
+        grouped[role].sort()
+    return grouped
+
+
+def _summarize_table_access(privileges: List[str]) -> str:
+    grouped = _group_privileges(privileges)
+    if not grouped:
+        return 'none'
+
+    write_privs = {'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'TRIGGER', 'REFERENCES'}
+    parts = []
+    for role in sorted(grouped.keys()):
+        privs = set(grouped[role])
+        if 'SELECT' in privs:
+            level = 'rw' if privs.intersection(write_privs) else 'ro'
+        else:
+            level = 'rw' if privs.intersection(write_privs) else 'none'
+        parts.append(f"{role}={level}")
+    return ', '.join(parts)
+
+
+def _summarize_schema_access(privileges: List[str]) -> str:
+    grouped = _group_privileges(privileges)
+    if not grouped:
+        return 'none'
+    parts = []
+    for role in sorted(grouped.keys()):
+        privs = grouped[role]
+        parts.append(f"{role}={'+'.join(p.lower() for p in privs)}")
+    return ', '.join(parts)
+
+
+def _format_table(headers: List[str], rows: List[List[str]]) -> str:
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(cell))
+    header_line = ' | '.join(h.ljust(widths[i]) for i, h in enumerate(headers))
+    divider = '-+-'.join('-' * widths[i] for i in range(len(widths)))
+    lines = [header_line, divider]
+    for row in rows:
+        lines.append(' | '.join(row[i].ljust(widths[i]) for i in range(len(headers))))
+    return '\n'.join(lines)
 
 
 def show_table_schema(conn, table_name: str):
@@ -249,6 +379,10 @@ def main():
                        help='List all tables')
     parser.add_argument('--schema', metavar='TABLE',
                        help='Show detailed schema for table (format: schema.table or table)')
+    parser.add_argument('--schemas', action='store_true',
+                       help='List all schemas')
+    parser.add_argument('--access', action='store_true',
+                       help='Include access rights in listings')
     parser.add_argument('--indexes', action='store_true',
                        help='List all indexes')
     parser.add_argument('--srids', action='store_true',
@@ -263,7 +397,7 @@ def main():
     args = parser.parse_args()
 
     # Default to showing tables if no specific option
-    if not any([args.tables, args.schema, args.indexes, args.srids, args.sample, args.all]):
+    if not any([args.tables, args.schemas, args.schema, args.indexes, args.srids, args.sample, args.all]):
         args.tables = True
 
     if args.all:
@@ -281,16 +415,56 @@ def main():
     conn = connect_db(db_params)
 
     try:
+        if args.schemas:
+            print("==> Schemas:")
+            schemas = list_schemas(conn, include_access=args.access)
+            if schemas:
+                table_rows = []
+                for schema in schemas:
+                    owner = schema.get('owner', 'unknown')
+                    access = ""
+                    if args.access:
+                        privileges = schema.get('privileges', [])
+                        access = _summarize_schema_access(privileges)
+                    table_rows.append([
+                        schema['schemaname'],
+                        owner,
+                        access if args.access else ''
+                    ])
+                headers = ['schema', 'owner']
+                if args.access:
+                    headers.append('access')
+                print(_format_table(headers, table_rows))
+            else:
+                print("  No schemas found")
+            print()
+
         if args.tables:
             print("==> Tables and Views:")
-            tables = list_tables(conn)
+            tables = list_tables(conn, include_access=args.access)
             if tables:
+                table_rows = []
                 for table in tables:
                     schema_table = f"{table['schemaname']}.{table['tablename']}"
                     table_type = table.get('table_type', 'TABLE').upper()
-                    rows = table['estimated_rows'] or 0
+                    rows = table['estimated_rows'] if table['estimated_rows'] is not None else 0
+                    rows_str = f"{rows:,}" if rows >= 0 else "?"
                     size = table['size'] or 'unknown'
-                    print(f"  {schema_table} ({table_type}): ~{rows:,} rows, {size}")
+                    access = ""
+                    if args.access:
+                        privileges = table.get('privileges', [])
+                        access = _summarize_table_access(privileges)
+                    table_rows.append([
+                        schema_table,
+                        table_type,
+                        size,
+                        rows_str,
+                        access if args.access else ''
+                    ])
+                headers = ['table', 'type', 'size', 'rows']
+                if args.access:
+                    headers.append('access')
+                print(_format_table(headers, table_rows))
             else:
                 print("  No tables or views found")
             print()

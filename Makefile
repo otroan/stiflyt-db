@@ -12,7 +12,8 @@ VENV := venv
 PYTHON := $(VENV)/bin/python3
 PIP := $(VENV)/bin/pip
 
-.PHONY: dependencies help create-db refresh-turrutebasen refresh-static
+.PHONY: dependencies help create-db refresh-turrutebasen refresh-static \
+	db-migrate-operational db-migrate-changeset db-migrate-all inspect-db
 
 help:
 	@echo "stiflyt-db Makefile"
@@ -22,6 +23,10 @@ help:
 	@echo "  make create-db      Create database + PostGIS extension"
 	@echo "  make refresh-turrutebasen Daily turrutebasen refresh"
 	@echo "  make refresh-static Monthly static refresh"
+	@echo "  make db-migrate-operational Run operational schema migration"
+	@echo "  make db-migrate-changeset  Run changeset schema migration"
+	@echo "  make db-migrate-all        Run operational then changeset"
+	@echo "  make inspect-db           List schemas, tables, views + access"
 	@echo ""
 	@echo "Variables:"
 	@echo "  PGDATABASE=$(PGDATABASE) PGHOST=$(PGHOST) PGPORT=$(PGPORT)"
@@ -130,6 +135,21 @@ create-db:
 				 echo "     Bruk superuser: PGUSER=postgres PGPASSWORD=password make create-db"; \
 				 exit 1)); \
 	fi
+
+db-migrate-operational: $(VENV)
+	@echo "==> Run operational schema migration ..."
+	@$(PYTHON) scripts/run_operational_migration.py
+
+db-migrate-changeset: $(VENV)
+	@echo "==> Run changeset schema migration ..."
+	@$(PYTHON) scripts/run_changeset_migration.py
+
+db-migrate-all: db-migrate-operational db-migrate-changeset
+	@echo "==> Operational + changeset migrations complete."
+
+inspect-db: $(VENV)
+	@echo "==> Inspect database schemas, tables, and access ..."
+	@$(PYTHON) scripts/inspect_db.py --schemas --tables --access
 
 refresh-turrutebasen: $(VENV)
 	@echo "==> Refresh turrutebasen (daily) ..."
