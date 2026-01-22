@@ -73,10 +73,6 @@ Creates topology tables and indexes for route network analysis (see migration fi
 
 Creates materialized view linking routes with route info (see migration file for details).
 
-### `004_add_link_endpoint_names.sql`
-
-Adds names to anchor nodes from ruteinfopunkt and stedsnavn (see migration file for details).
-
 ### `005_create_stable_views.sql`
 
 Creates stable views in a fixed `stiflyt` schema that point to the current dynamic schema.

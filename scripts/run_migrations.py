@@ -726,7 +726,6 @@ def main():
     #   002: build_topology (requires fotrute, creates nodes)
     #   -> build-links (requires fotrute + nodes, creates links)
     #   003: add_link_ruteinfo_view (requires links)
-    #   004: add_link_endpoint_names (requires links)
     #   005: create_stable_views (requires links)
     #   007: create_route_views (requires links)
 

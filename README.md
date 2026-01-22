@@ -241,7 +241,6 @@ Located in `migrations/` directory:
 - **`001_add_fotrute_indexes.sql`** - Creates critical indexes for the turrutebasen dataset
 - **`002_build_topology.sql`** - Builds topology for route networks
 - **`003_add_link_ruteinfo_view.sql`** - Creates views for route information
-- **`004_add_link_endpoint_names.sql`** - Adds endpoint name mappings
 
 ### Manual Migration Execution
 

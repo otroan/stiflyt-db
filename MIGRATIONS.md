@@ -69,14 +69,6 @@ Creates views that join `links` with `fotruteinfo`:
 
 Depends on `links` being created by the build-links step.
 
-### `004_add_link_endpoint_names.sql`
-
-Adds names to anchor nodes:
-
-- Creates `node_names` materialized view from `ruteinfopunkt`, optionally
-  enriched by `stedsnavn` when available.
-- Rebuilds `anchor_nodes` with `navn` and `navn_kilde`.
-
 ### `005_create_stable_views.sql`
 
 Creates a fixed `stiflyt` schema with views pointing to the latest dynamic
