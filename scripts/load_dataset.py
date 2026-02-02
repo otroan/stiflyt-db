@@ -237,13 +237,13 @@ def drop_schemas_by_prefix(db_params: dict, schema_prefix: str) -> bool:
     cmd.extend(['-U', db_params['user'], '-d', db_params['database'], '-q', '-t'])
 
     # Query for schemas matching the prefix pattern
-    # Exclude system schemas
+    # Exclude system schemas AND operational schema (ops) - must never be dropped
     find_schemas_sql = f"""
         {role_preamble_sql()}
         SELECT nspname
         FROM pg_namespace
         WHERE nspname LIKE '{schema_prefix}_%'
-        AND nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1')
+        AND nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_temp_1', 'pg_toast_temp_1', 'ops', 'stiflyt', 'changeset')
         ORDER BY nspname;
         {role_reset_sql()}
     """
@@ -263,6 +263,14 @@ def drop_schemas_by_prefix(db_params: dict, schema_prefix: str) -> bool:
 
         if not schema_names:
             return True  # No schemas to drop
+
+        # Safety check: ensure we're not accidentally dropping protected schemas
+        protected_schemas = {'ops', 'stiflyt', 'changeset'}
+        protected_found = [name for name in schema_names if name in protected_schemas]
+        if protected_found:
+            print(f"  ⚠ KRITISK: Forsøker å slette beskyttede schemas: {', '.join(protected_found)}", file=sys.stderr)
+            print(f"  ⚠ Dette skal ikke skje - avbryter drop-operasjon", file=sys.stderr)
+            return False
 
         print(f"  Fant {len(schema_names)} schema(er) med prefix '{schema_prefix}': {', '.join(schema_names)}")
 

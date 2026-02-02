@@ -17,8 +17,38 @@ CREATE TABLE IF NOT EXISTS ops.endpoint_names (
     UNIQUE (anchor_node_id, rutenummer_key)
 );
 
+-- Add geometry column if it doesn't exist (for stable matching across refreshes)
+-- Node IDs change, but geometry is stable
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'ops'
+          AND table_name = 'endpoint_names'
+          AND column_name = 'geom'
+    ) THEN
+        ALTER TABLE ops.endpoint_names
+        ADD COLUMN geom GEOMETRY(POINT) NULL;
+    END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS endpoint_names_anchor_idx
 ON ops.endpoint_names (anchor_node_id);
+
+CREATE INDEX IF NOT EXISTS endpoint_names_geom_gist
+ON ops.endpoint_names USING GIST (geom);
+
+-- Populate geometry for existing endpoint_names that don't have it
+-- Match by current anchor_node_id
+DO $$
+BEGIN
+    UPDATE ops.endpoint_names en
+    SET geom = an.geom
+    FROM stiflyt.anchor_nodes an
+    WHERE en.anchor_node_id = an.node_id
+      AND en.geom IS NULL
+      AND an.geom IS NOT NULL;
+END $$;
 
 CREATE TABLE IF NOT EXISTS ops.number_spaces (
     id BIGSERIAL PRIMARY KEY,

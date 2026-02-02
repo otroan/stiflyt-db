@@ -289,6 +289,40 @@ def load_route_info(conn, schema: str) -> Dict[int, Set[str]]:
     return dict(segment_routes)
 
 
+def compute_metadata_anchor_nodes(
+    adjacency: Dict[int, List[Tuple[int, int]]],
+    segment_routes: Dict[int, Set[str]],
+) -> Set[int]:
+    """Compute additional anchor nodes based on route-metadata boundaries.
+
+    Motivation:
+    - Links are intended to be maximal chains *with equal metadata*.
+    - In practice, a node can have degree=2 (so it is NOT a topology anchor),
+      but still represent a semantic boundary where route memberships change.
+      Example: one incident segment has routes {bre16, 20160407} while the other
+      has only {bre16}. These should NOT be merged into one link.
+
+    Rule:
+    - If a node has incident segments with differing route-set (rutenummer set),
+      treat it as an anchor for link-building so links split there.
+    """
+
+    def route_set(seg_id: int) -> frozenset[str]:
+        routes = segment_routes.get(seg_id)
+        if not routes:
+            return frozenset()
+        return frozenset(str(r) for r in routes)
+
+    metadata_anchors: Set[int] = set()
+    for node_id, incident in adjacency.items():
+        if not incident:
+            continue
+        route_sets = {route_set(seg_id) for seg_id, _other in incident}
+        if len(route_sets) > 1:
+            metadata_anchors.add(node_id)
+    return metadata_anchors
+
+
 def build_route_continuous_geometries(
     links: List[Dict],
     link_segments: List[Dict],
@@ -573,7 +607,8 @@ def build_route_continuous_geometries(
 def build_links(
     segments_dict: Dict[int, Dict],
     adjacency: Dict[int, List[Tuple[int, int]]],
-    anchor_nodes: Set[int]
+    anchor_nodes: Set[int],
+    segment_routes: Optional[Dict[int, Set[str]]] = None,
 ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """
     Build links by walking from anchor nodes.
@@ -587,6 +622,14 @@ def build_links(
     links: List[Dict] = []
     link_segments_list: List[Dict] = []
     errors: List[Dict] = []
+
+    def route_set(seg_id: int) -> frozenset[str]:
+        if not segment_routes:
+            return frozenset()
+        routes = segment_routes.get(seg_id)
+        if not routes:
+            return frozenset()
+        return frozenset(str(r) for r in routes)
 
     # Sort anchor nodes for determinism
     sorted_anchors = sorted(anchor_nodes)
@@ -607,6 +650,7 @@ def build_links(
             link_segment_ids = [seg_id]
             used_segments.add(seg_id)
             visited_nodes = {anchor}  # Track visited nodes for loop detection (start with anchor only)
+            link_route_set = route_set(seg_id)
 
             # Walk until we hit an anchor or error
             while current_node not in anchor_nodes:
@@ -659,6 +703,19 @@ def build_links(
 
                 # Exactly one segment - continue walking
                 next_seg_id, next_node = available[0]
+                # Optional: enforce "equal metadata" within a link. If route-set changes,
+                # stop the link here (this node should normally be a metadata anchor).
+                if segment_routes is not None and route_set(next_seg_id) != link_route_set:
+                    errors.append({
+                        'type': 'metadata_boundary',
+                        'node_id': current_node,
+                        'segment_id': next_seg_id,
+                        'message': (
+                            f'Metadata boundary at node {current_node}: '
+                            f'link routes {sorted(link_route_set)} vs next segment routes {sorted(route_set(next_seg_id))}'
+                        )
+                    })
+                    break
                 link_segment_ids.append(next_seg_id)
                 used_segments.add(next_seg_id)
                 visited_nodes.add(current_node)
@@ -908,6 +965,40 @@ def print_qa_report(links: List[Dict], total_segments: int, used_segments: Set[i
     print("="*60)
 
 
+def find_mixed_metadata_links(
+    links: List[Dict],
+    segment_routes: Dict[int, Set[str]],
+    limit: int = 20,
+) -> List[Dict]:
+    """Detect links whose segments have differing route-sets (metadata mismatch)."""
+    def route_set(seg_id: int) -> frozenset[str]:
+        routes = segment_routes.get(seg_id)
+        if not routes:
+            return frozenset()
+        return frozenset(str(r) for r in routes)
+
+    findings: List[Dict] = []
+    for link in links:
+        seg_ids = link.get("segment_ids") or link.get("segment_objids") or []
+        if not seg_ids:
+            continue
+        sets = [route_set(int(sid)) for sid in seg_ids]
+        distinct = sorted({tuple(sorted(s)) for s in sets})
+        if len(distinct) > 1:
+            findings.append(
+                {
+                    "link_id": link.get("link_id"),
+                    "a_node": link.get("a_node"),
+                    "b_node": link.get("b_node"),
+                    "segment_ids": seg_ids,
+                    "distinct_route_sets": distinct,
+                }
+            )
+            if len(findings) >= limit:
+                break
+    return findings
+
+
 def setup_logging(log_dir: Path) -> Path:
     """Setup logging directory and return log file path."""
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -1142,10 +1233,30 @@ def build_links_main(args=None, log_file=None) -> int:
         # Build links
         log("==> Building links...", log_file)
         try:
-            links, link_segments, errors = build_links(segments_dict, adjacency, anchor_nodes)
+            # Add metadata-based anchors so links split when route memberships change.
+            metadata_anchors = compute_metadata_anchor_nodes(adjacency, segment_routes)
+            combined_anchors = set(anchor_nodes) | set(metadata_anchors)
+            log(f"  ✓ Added {len(metadata_anchors)} metadata anchor nodes (route-boundary splits)", log_file)
+
+            links, link_segments, errors = build_links(
+                segments_dict, adjacency, combined_anchors, segment_routes=segment_routes
+            )
             log(f"  ✓ Built {len(links)} links from {len(link_segments)} segments", log_file)
             if errors:
                 log(f"  ⚠ Found {len(errors)} errors (dangling/branch/loop)", log_file)
+
+            # QA: verify invariant that links do not mix route-sets
+            mixed = find_mixed_metadata_links(links, segment_routes, limit=20)
+            if mixed:
+                log(f"  ⚠ Found {len(mixed)} link(s) with mixed route metadata (showing up to 20):", log_file)
+                for m in mixed:
+                    log(
+                        f"    - link {m['link_id']} ({m['a_node']} -> {m['b_node']}), "
+                        f"distinct route-sets={m['distinct_route_sets']}",
+                        log_file,
+                    )
+            else:
+                log("  ✓ QA: No mixed-metadata links detected", log_file)
         except Exception as e:
             log(f"✗ Failed to build links: {e}", log_file)
             return 1

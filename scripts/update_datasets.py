@@ -884,6 +884,105 @@ def main():
     except Exception as e:
         log(f"  ⚠ Health check failed: {e}", log_file)
 
+    # Verify operational schema is intact (critical safeguard)
+    log("==> Verifying operational schema integrity...", log_file)
+    try:
+        db_params = get_db_connection_params()
+        db_params['database'] = database
+        conn = connect_db(db_params)
+
+        if conn:
+            with conn.cursor() as cur:
+                # Check if ops schema exists
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM information_schema.schemata
+                        WHERE schema_name = 'ops'
+                    )
+                """)
+                schema_exists = cur.fetchone()[0]
+
+                if not schema_exists:
+                    log("  ✗ KRITISK: ops schema mangler etter refresh!", log_file)
+                    log("  ⚠ Operasjonell database kan ha blitt slettet", log_file)
+                    log("  ⚠ Løsning: Kjør 'make db-migrate-operational' for å gjenopprette", log_file)
+                else:
+                    # Check for expected tables
+                    cur.execute("""
+                        SELECT table_name
+                        FROM information_schema.tables
+                        WHERE table_schema = 'ops'
+                        ORDER BY table_name
+                    """)
+                    tables = [row[0] for row in cur.fetchall()]
+
+                    expected_tables = ['endpoint_names', 'number_spaces']
+                    missing_tables = [t for t in expected_tables if t not in tables]
+
+                    if missing_tables:
+                        log(f"  ⚠ ops schema eksisterer, men mangler tabeller: {', '.join(missing_tables)}", log_file)
+                        log("  ⚠ Løsning: Kjør 'make db-migrate-operational' for å synkronisere", log_file)
+                    else:
+                        # Check row counts for data integrity
+                        cur.execute("SELECT COUNT(*) FROM ops.endpoint_names")
+                        endpoint_count = cur.fetchone()[0]
+                        cur.execute("SELECT COUNT(*) FROM ops.number_spaces")
+                        number_spaces_count = cur.fetchone()[0]
+
+                        log(f"  ✓ ops schema intakt", log_file)
+                        log(f"    Tabeller: {', '.join(tables)}", log_file)
+                        log(f"    Data: {endpoint_count} endpoint_names, {number_spaces_count} number_spaces", log_file)
+
+                        # Sync endpoint_names anchor_node_id after refresh
+                        # This is critical because node IDs change after refresh
+                        if endpoint_count > 0:
+                            log("  → Synkroniserer endpoint_names anchor_node_id...", log_file)
+                            try:
+                                sync_cmd = [
+                                    sys.executable,
+                                    str(Path(__file__).parent / "sync_endpoint_names_anchors.py"),
+                                    "--tolerance", "1.0"
+                                ]
+                                sync_result = subprocess.run(
+                                    sync_cmd,
+                                    env=os.environ.copy(),
+                                    capture_output=True,
+                                    text=True
+                                )
+                                if sync_result.returncode == 0:
+                                    log("    ✓ Endpoint names synkronisert", log_file)
+                                else:
+                                    log(f"    ⚠ Synkronisering feilet: {sync_result.stderr}", log_file)
+                                    log("    ⚠ Kjør manuelt: python3 scripts/sync_endpoint_names_anchors.py", log_file)
+                            except Exception as sync_error:
+                                log(f"    ⚠ Kunne ikke kjøre synkronisering: {sync_error}", log_file)
+
+                            # Populate geometries for future matching
+                            log("  → Populerer geometri for endpoint_names...", log_file)
+                            try:
+                                populate_cmd = [
+                                    sys.executable,
+                                    str(Path(__file__).parent / "populate_endpoint_geometries.py")
+                                ]
+                                populate_result = subprocess.run(
+                                    populate_cmd,
+                                    env=os.environ.copy(),
+                                    capture_output=True,
+                                    text=True
+                                )
+                                if populate_result.returncode == 0:
+                                    log("    ✓ Geometri populeret", log_file)
+                                else:
+                                    log(f"    ⚠ Populering feilet: {populate_result.stderr}", log_file)
+                            except Exception as populate_error:
+                                log(f"    ⚠ Kunne ikke populere geometri: {populate_error}", log_file)
+            conn.close()
+        else:
+            log("  ⚠ Kunne ikke koble til database for ops-verifisering", log_file)
+    except Exception as e:
+        log(f"  ⚠ Ops schema verifisering feilet: {e}", log_file)
+        log("  ⚠ Verifiser manuelt at ops schema eksisterer og har data", log_file)
+
     log("=== End of update ===", log_file)
 
     # Clean up old logs (keep last 30 days)
