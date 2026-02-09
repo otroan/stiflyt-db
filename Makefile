@@ -21,7 +21,7 @@ help:
 	@echo "Common targets:"
 	@echo "  make dependencies   Install system deps (Debian/Ubuntu)"
 	@echo "  make create-db      Create database + PostGIS extension"
-	@echo "  make refresh-turrutebasen Daily turrutebasen refresh"
+	@echo "  make refresh-turrutebasen Daily turrutebasen refresh (data + migrations + ankernavn)"
 	@echo "  make refresh-static Monthly static refresh"
 	@echo "  make db-migrate-operational Run operational schema migration"
 	@echo "  make db-migrate-changeset  Run changeset schema migration"
@@ -154,6 +154,13 @@ inspect-db: $(VENV)
 refresh-turrutebasen: $(VENV)
 	@echo "==> Refresh turrutebasen (daily) ..."
 	@PGUSER=stiflyt_updater $(PYTHON) scripts/refresh_swap.py $(PGDATABASE) --config-file datasets_turrutebasen_only.yaml
+	@echo "==> Kjører migrasjoner (topologi, views, ankernavn) ..."
+	@PGUSER=stiflyt_updater $(PYTHON) scripts/run_migrations.py $(PGDATABASE)
+	@echo "==> Synkroniserer ankernavn (endpoint_names) ..."
+	@PGUSER=stiflyt_updater $(PYTHON) scripts/sync_endpoint_names_anchors.py --tolerance 1.0
+	@echo "==> Populerer geometri for endpoint_names ..."
+	@PGUSER=stiflyt_updater $(PYTHON) scripts/populate_endpoint_geometries.py
+	@echo "✓ Turrutebasen-oppdatering ferdig"
 
 refresh-static: $(VENV)
 	@echo "==> Refresh static datasets (monthly) ..."
