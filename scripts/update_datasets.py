@@ -789,12 +789,22 @@ def main():
     else:
         log("  ⊙ No successful imports - skipping sanity checks", log_file)
 
-    # Run migrations after data import
     has_turrutebasen = any(
         (cfg.get('name', '').lower() == 'turrutebasen')
         or ('turrutebasen' in cfg.get('dataset', '').lower())
         for cfg in configs
     )
+
+    # Diff on raw turogfriluftsruter_* tables (before migrations) so we don't miss changes
+    if has_turrutebasen and success_count > 0:
+        log("==> Diff på rådata (før migrasjoner)...", log_file)
+        try:
+            from refresh_diff_report import run_after_load
+            run_after_load(database, log_file.parent, log_fn=lambda msg: log(msg, log_file))
+        except Exception as e:
+            log(f"  ⚠ Diff-rapport feilet (ikke kritisk): {e}", log_file)
+
+    # Run migrations after data import
     log("==> Running database migrations...", log_file)
     try:
         script_dir = Path(__file__).parent
@@ -814,9 +824,9 @@ def main():
             from run_migrations import find_migration_files, run_migration, get_db_connection_params as get_migration_db_params
 
             migration_files = find_migration_files(migration_dir)
+            # 005 runs once at the end to refresh stable views; don't include it in the loop
             allowed = {
                 "000_setup_roles.sql",
-                "005_create_stable_views.sql",
                 "006_add_static_indexes.sql",
                 "008_fix_grant_schema_privileges_for_prefix.sql",
             }
@@ -845,9 +855,9 @@ def main():
                     log(f"  ✗ Some migrations failed: {migration_failed} failed", log_file)
                     sys.exit(1)
 
-                # Refresh stable views after imports/migrations
-                migration_005 = next((f for f in migration_files if f.name.startswith('005_')), None)
-                if migration_005:
+                # Run 005 once to create/refresh stable views (not in loop to avoid running it twice)
+                migration_005 = migration_dir / "005_create_stable_views.sql"
+                if migration_005.exists():
                     log(f"  -> Refreshing views with {migration_005.name}...", log_file)
                     if run_migration(migration_db_params, migration_005):
                         log(f"     ✓ {migration_005.name} completed", log_file)

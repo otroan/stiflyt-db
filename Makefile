@@ -154,8 +154,6 @@ inspect-db: $(VENV)
 refresh-turrutebasen: $(VENV)
 	@echo "==> Refresh turrutebasen (daily) ..."
 	@PGUSER=stiflyt_updater $(PYTHON) scripts/refresh_swap.py $(PGDATABASE) --config-file datasets_turrutebasen_only.yaml
-	@echo "==> Kjører migrasjoner (topologi, views, ankernavn) ..."
-	@PGUSER=stiflyt_updater $(PYTHON) scripts/run_migrations.py $(PGDATABASE)
 	@echo "==> Synkroniserer ankernavn (endpoint_names) ..."
 	@PGUSER=stiflyt_updater $(PYTHON) scripts/sync_endpoint_names_anchors.py --tolerance 1.0
 	@echo "==> Populerer geometri for endpoint_names ..."
