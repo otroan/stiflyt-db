@@ -603,6 +603,16 @@ def build_route_continuous_geometries(
         """)
         conn.commit()
 
+        # The `links_with_routes` view (created in migration 005) is owned by
+        # stiflyt_owner and projects from this table; without explicit grants
+        # any query that touches route_geometries fails with
+        # "permission denied for table route_continuous_geometries".
+        cur.execute(f"""
+            GRANT SELECT ON {schema}.route_continuous_geometries TO stiflyt_owner;
+            GRANT SELECT ON {schema}.route_continuous_geometries TO stiflyt_reader;
+        """)
+        conn.commit()
+
 
 def build_links(
     segments_dict: Dict[int, Dict],

@@ -13,7 +13,7 @@ PYTHON := $(VENV)/bin/python3
 PIP := $(VENV)/bin/pip
 
 .PHONY: dependencies help create-db refresh-turrutebasen refresh-static \
-	db-migrate-operational db-migrate-changeset db-migrate-all inspect-db
+	db-migrate-operational db-migrate-changeset db-migrate-all run-migrations inspect-db
 
 help:
 	@echo "stiflyt-db Makefile"
@@ -26,6 +26,7 @@ help:
 	@echo "  make db-migrate-operational Run operational schema migration"
 	@echo "  make db-migrate-changeset  Run changeset schema migration"
 	@echo "  make db-migrate-all        Run operational then changeset"
+	@echo "  make run-migrations       Apply numbered SQL migrations from migrations/"
 	@echo "  make inspect-db           List schemas, tables, views + access"
 	@echo ""
 	@echo "Variables:"
@@ -146,6 +147,10 @@ db-migrate-changeset: $(VENV)
 
 db-migrate-all: db-migrate-operational db-migrate-changeset
 	@echo "==> Operational + changeset migrations complete."
+
+run-migrations: $(VENV)
+	@echo "==> Apply numbered migrations from migrations/ to $(PGDATABASE) ..."
+	@$(PYTHON) scripts/run_migrations.py $(PGDATABASE)
 
 inspect-db: $(VENV)
 	@echo "==> Inspect database schemas, tables, and access ..."
