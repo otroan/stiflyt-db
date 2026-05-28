@@ -269,7 +269,7 @@ def load_segments(conn, schema: str) -> Tuple[Dict[int, Dict], Dict[int, List[Tu
 
 def load_route_info(conn, schema: str) -> Dict[int, Set[str]]:
     """Load route information for segments.
-    
+
     Returns:
         segment_routes: {segment_id: {rutenummer, ...}}
     """
@@ -279,19 +279,49 @@ def load_route_info(conn, schema: str) -> Dict[int, Set[str]]:
             FROM {schema}.fotruteinfo
             WHERE rutenummer IS NOT NULL
         """)
-        
+
         segment_routes: Dict[int, Set[str]] = defaultdict(set)
         for row in cur.fetchall():
             segment_id = row[0]
             rutenummer = row[1]
             segment_routes[segment_id].add(rutenummer)
-    
+
     return dict(segment_routes)
+
+
+def load_unmarked_segments(conn) -> Set[int]:
+    """Set of fotrute_fk that are tagged unmarked (boat/glacier) in
+    ops.unmarked_segment.
+
+    Used by compute_metadata_anchor_nodes so the link-builder splits at every
+    boundary between an unmarked fotrute and a marked one — otherwise a glacier
+    fotrute that shares a degree-2 node with its non-glacier neighbours gets
+    merged into one mega-link and the whole link inherits is_unmarked=true via
+    `bool_or` in ops.route_link_graph. (See bre8/Fortundalsbreen: six fotruter
+    coalesced into a single 14.5 km link, only one of which crosses the
+    glacier.)
+
+    Returns an empty set (and logs a notice) if ops.unmarked_segment doesn't
+    exist yet — the table is created by migration 017.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'ops' AND table_name = 'unmarked_segment'
+            )
+        """)
+        if not cur.fetchone()[0]:
+            print("  · ops.unmarked_segment not present; skipping unmarked-boundary anchors")
+            return set()
+        cur.execute("SELECT fotrute_fk FROM ops.unmarked_segment")
+        return {row[0] for row in cur.fetchall()}
 
 
 def compute_metadata_anchor_nodes(
     adjacency: Dict[int, List[Tuple[int, int]]],
     segment_routes: Dict[int, Set[str]],
+    unmarked_segments: Optional[Set[int]] = None,
 ) -> Set[int]:
     """Compute additional anchor nodes based on route-metadata boundaries.
 
@@ -303,22 +333,27 @@ def compute_metadata_anchor_nodes(
       has only {bre16}. These should NOT be merged into one link.
 
     Rule:
-    - If a node has incident segments with differing route-set (rutenummer set),
-      treat it as an anchor for link-building so links split there.
-    """
+    - If a node has incident segments with differing fingerprint
+      (rutenummer set, is_unmarked) tuple, treat it as an anchor for link-
+      building so links split there.
 
-    def route_set(seg_id: int) -> frozenset[str]:
+    The unmarked dimension matters because ops.route_link_graph aggregates
+    is_unmarked per link with bool_or — so a single glacier fotrute merged
+    into a 14 km link makes the whole link dotted on the map.
+    """
+    unmarked_segments = unmarked_segments or set()
+
+    def fingerprint(seg_id: int) -> Tuple[frozenset, bool]:
         routes = segment_routes.get(seg_id)
-        if not routes:
-            return frozenset()
-        return frozenset(str(r) for r in routes)
+        route_fp = frozenset(str(r) for r in routes) if routes else frozenset()
+        return (route_fp, seg_id in unmarked_segments)
 
     metadata_anchors: Set[int] = set()
     for node_id, incident in adjacency.items():
         if not incident:
             continue
-        route_sets = {route_set(seg_id) for seg_id, _other in incident}
-        if len(route_sets) > 1:
+        prints = {fingerprint(seg_id) for seg_id, _other in incident}
+        if len(prints) > 1:
             metadata_anchors.add(node_id)
     return metadata_anchors
 
@@ -1236,6 +1271,9 @@ def build_links_main(args=None, log_file=None) -> int:
             # Load route info for continuous geometry building
             segment_routes = load_route_info(conn, schema)
             log(f"  ✓ Loaded route info for {len(segment_routes)} segments", log_file)
+
+            unmarked_segments = load_unmarked_segments(conn)
+            log(f"  ✓ Loaded {len(unmarked_segments)} unmarked-tagged segments", log_file)
         except Exception as e:
             log(f"✗ Failed to load data: {e}", log_file)
             return 1
@@ -1243,10 +1281,13 @@ def build_links_main(args=None, log_file=None) -> int:
         # Build links
         log("==> Building links...", log_file)
         try:
-            # Add metadata-based anchors so links split when route memberships change.
-            metadata_anchors = compute_metadata_anchor_nodes(adjacency, segment_routes)
+            # Add metadata-based anchors so links split when route memberships
+            # OR unmarked status changes.
+            metadata_anchors = compute_metadata_anchor_nodes(
+                adjacency, segment_routes, unmarked_segments=unmarked_segments,
+            )
             combined_anchors = set(anchor_nodes) | set(metadata_anchors)
-            log(f"  ✓ Added {len(metadata_anchors)} metadata anchor nodes (route-boundary splits)", log_file)
+            log(f"  ✓ Added {len(metadata_anchors)} metadata anchor nodes (route/unmarked boundary splits)", log_file)
 
             links, link_segments, errors = build_links(
                 segments_dict, adjacency, combined_anchors, segment_routes=segment_routes
